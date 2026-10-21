@@ -67,10 +67,16 @@ mod tests {
                 data: &img,
             };
             let mut packets = Vec::new();
+            let t = std::time::Instant::now();
             enc.encode(&frame, i as u64 * 16_667, i == 0, |d, key| {
                 packets.push((d.to_vec(), key))
             })
             .unwrap();
+            eprintln!(
+                "frame {i}: {} packet(s) after {:?}",
+                packets.len(),
+                t.elapsed()
+            );
             assert_eq!(
                 packets.len(),
                 1,

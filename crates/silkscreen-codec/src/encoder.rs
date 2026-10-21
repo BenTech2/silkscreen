@@ -125,6 +125,8 @@ pub struct Encoder {
     frame: Frame,
     input: Input,
     pkt: Packet,
+    /// Packets produced so far.
+    frames_out: u64,
 }
 
 // Each encoder is driven by a single thread at a time.
@@ -280,6 +282,7 @@ impl Encoder {
                 frame,
                 input,
                 pkt: Packet::new()?,
+                frames_out: 0,
             })
         }
     }
@@ -382,11 +385,17 @@ impl Encoder {
             // Most hardware encoders return the packet right away; some
             // (VideoToolbox) finish asynchronously a moment later. Wait for
             // it rather than letting every frame go out one frame late.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
-            while self.drain(emit)? == 0 && std::time::Instant::now() < deadline {
+            // The very first frame can take much longer (session start-up).
+            let wait = if self.frames_out == 0 { 1000 } else { 40 };
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait);
+            loop {
+                let n = self.drain(emit)?;
+                self.frames_out += n as u64;
+                if n > 0 || std::time::Instant::now() >= deadline {
+                    return Ok(());
+                }
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
-            Ok(())
         }
     }
 
