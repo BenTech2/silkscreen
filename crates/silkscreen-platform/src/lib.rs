@@ -114,6 +114,15 @@ pub fn diagnostics() -> Vec<(String, String)> {
     Vec::new()
 }
 
+/// Registers the app with the desktop where that is how it gets its icon
+/// (Linux: a desktop entry plus the icon in the user's hicolor theme).
+pub fn install_app_entry() {
+    #[cfg(target_os = "linux")]
+    if let Err(e) = linux::install_app_entry() {
+        tracing::warn!("could not install the desktop entry: {e}");
+    }
+}
+
 /// Maximum simultaneous touch contacts of this machine's built-in panel, or
 /// 0 if it has no touchscreen.
 pub fn touch_points() -> u8 {

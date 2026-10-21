@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Silkscreen app icon ("Extended"): your screen, plus a second one
+       receiving it wirelessly. Master artwork; all platform icons are
+       rendered from this file by scripts/render-icons.sh. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#14213f"/>
+      <stop offset="1" stop-color="#0b1226"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="230" fill="url(#bg)"/>
+  <rect x="128" y="300" width="430" height="310" rx="44" fill="#e8eeff"/>
+  <rect x="452" y="392" width="444" height="320" rx="48" fill="#0f1832" stroke="#6ea8fe" stroke-width="40"/>
+  <path d="M612 540A140 140 0 0 1 736 540M640 590A84 84 0 0 1 708 590" fill="none" stroke="#6ea8fe" stroke-width="34" stroke-linecap="round"/>
+  <circle cx="674" cy="636" r="22" fill="#6ea8fe"/>
+</svg>

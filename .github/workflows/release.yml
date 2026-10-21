@@ -24,17 +24,28 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - run: brew install ffmpeg pkg-config dylibbundler
       - run: cargo build --release -p silkscreen
-      - name: Bundle with its own FFmpeg
+      - name: Build Silkscreen.app with its own FFmpeg
         run: |
           out=dist/silkscreen-macos-arm64
-          mkdir -p "$out/lib"
-          cp target/release/silkscreen "$out/"
-          # Copy Homebrew's FFmpeg and its dependencies next to the binary.
-          dylibbundler -od -b -x "$out/silkscreen" -d "$out/lib" -p @executable_path/lib/
+          app=$out/Silkscreen.app/Contents
+          mkdir -p "$app/MacOS" "$app/Frameworks" "$app/Resources"
+          cp target/release/silkscreen "$app/MacOS/"
+          # Copy Homebrew's FFmpeg and its dependencies into the bundle.
+          dylibbundler -od -b -x "$app/MacOS/silkscreen" -d "$app/Frameworks" -p @executable_path/../Frameworks/
+          # App icon from the PNGs rendered by scripts/render-icons.sh.
+          set=$RUNNER_TEMP/silkscreen.iconset && mkdir -p "$set"
+          for s in 16 32 128 256 512; do
+            cp assets/png/icon-$s.png "$set/icon_${s}x${s}.png"
+            cp assets/png/icon-$((s * 2)).png "$set/icon_${s}x${s}@2x.png"
+          done
+          iconutil -c icns "$set" -o "$app/Resources/silkscreen.icns"
+          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "silkscreen") | .version')
+          sed "s/@VERSION@/$version/g" assets/Info.plist > "$app/Info.plist"
           # Rewriting load paths invalidates signatures; Apple Silicon needs one.
-          for f in "$out"/lib/*.dylib "$out/silkscreen"; do codesign --force -s - "$f"; done
+          for f in "$app"/Frameworks/*.dylib; do codesign --force -s - "$f"; done
+          codesign --force -s - "$out/Silkscreen.app"
           cp README.md "$out/"
-          "$out/silkscreen" doctor
+          "$app/MacOS/silkscreen" doctor
           (cd dist && zip -qry silkscreen-macos-arm64.zip silkscreen-macos-arm64)
       - run: gh release upload "$TAG" dist/silkscreen-macos-arm64.zip --clobber
         env:

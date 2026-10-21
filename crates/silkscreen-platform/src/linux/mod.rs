@@ -88,6 +88,10 @@ fn open_kwin(req: &ScreenRequest) -> Result<Screen> {
     })
 }
 
+pub fn install_app_entry() -> Result<()> {
+    kwin::ensure_desktop_entry().map(|_| ())
+}
+
 pub fn diagnostics() -> Vec<(String, String)> {
     let session = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let desktop = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();

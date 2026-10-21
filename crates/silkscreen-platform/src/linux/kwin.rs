@@ -505,6 +505,21 @@ fn set_scale(output: &str, scale: f64) {
     }
 }
 
+/// Installs the app icon into the user's hicolor theme, next to the
+/// applications directory, for the desktop entry's `Icon=silkscreen`.
+fn install_icon(applications: &std::path::Path) {
+    const SVG: &[u8] = include_bytes!("../../../../assets/icon.svg");
+    let Some(data) = applications.parent() else { return };
+    let dir = data.join("icons/hicolor/scalable/apps");
+    let path = dir.join("silkscreen.svg");
+    if std::fs::read(&path).is_ok_and(|c| c == SVG) {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&dir).and_then(|_| std::fs::write(&path, SVG)) {
+        warn!("could not install the app icon: {e}");
+    }
+}
+
 /// Installs (or updates) `~/.local/share/applications/silkscreen.desktop`
 /// so KWin grants this executable the interfaces above. Returns `true` if
 /// the file changed — KWin reads it when a client connects, so the change
@@ -521,12 +536,13 @@ pub fn ensure_desktop_entry() -> Result<bool> {
          Type=Application\n\
          Name=Silkscreen\n\
          Comment=Use another computer as a wireless display\n\
-         Exec={} display\n\
-         Icon=video-display\n\
+         Exec={}\n\
+         Icon=silkscreen\n\
          Categories=Utility;\n\
          X-KDE-Wayland-Interfaces={SCREENCAST},{FAKE_INPUT}\n",
         exe.display()
     );
+    install_icon(&dir);
     if std::fs::read_to_string(&path).is_ok_and(|c| c == contents) {
         return Ok(false);
     }

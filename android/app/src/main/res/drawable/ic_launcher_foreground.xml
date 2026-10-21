@@ -1,12 +1,19 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- A monitor outline with a signal arc: "wireless display". -->
+<!-- assets/icon.svg's artwork (1024 grid), scaled into the adaptive icon's
+     66dp safe zone: your screen, plus a second one receiving it wirelessly. -->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp"
     android:viewportWidth="108" android:viewportHeight="108">
-    <path android:strokeColor="#6EA8FE" android:strokeWidth="5" android:fillColor="#00000000"
-        android:pathData="M30,38 h48 a4,4 0 0 1 4,4 v26 a4,4 0 0 1 -4,4 h-48 a4,4 0 0 1 -4,-4 v-26 a4,4 0 0 1 4,-4 z" />
-    <path android:strokeColor="#6EA8FE" android:strokeWidth="5" android:fillColor="#00000000"
-        android:pathData="M44,82 h20" />
-    <path android:strokeColor="#FFFFFF" android:strokeWidth="4" android:fillColor="#00000000"
-        android:pathData="M44,58 a14,14 0 0 1 20,0 M49,63 a7,7 0 0 1 10,0" />
+    <group android:scaleX="0.072" android:scaleY="0.072"
+        android:translateX="16.42" android:translateY="16.85">
+        <path android:fillColor="#E8EEFF"
+            android:pathData="M172,300H514A44,44 0 0 1 558,344V566A44,44 0 0 1 514,610H172A44,44 0 0 1 128,566V344A44,44 0 0 1 172,300Z" />
+        <path android:fillColor="#0F1832" android:strokeColor="#6EA8FE" android:strokeWidth="40"
+            android:pathData="M500,392H848A48,48 0 0 1 896,440V664A48,48 0 0 1 848,712H500A48,48 0 0 1 452,664V440A48,48 0 0 1 500,392Z" />
+        <path android:fillColor="#00000000" android:strokeColor="#6EA8FE" android:strokeWidth="34"
+            android:strokeLineCap="round"
+            android:pathData="M612,540A140,140 0 0 1 736,540M640,590A84,84 0 0 1 708,590" />
+        <path android:fillColor="#6EA8FE"
+            android:pathData="M652,636A22,22 0 1 0 696,636A22,22 0 1 0 652,636Z" />
+    </group>
 </vector>

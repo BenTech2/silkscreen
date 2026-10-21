@@ -49,6 +49,7 @@ pub struct GuiOptions {
 }
 
 pub fn run(opts: GuiOptions, ctx: Arc<Ctx>) -> Result<()> {
+    silkscreen_platform::install_app_entry();
     let event_loop = EventLoop::<UiEvent>::with_user_event().build()?;
     let proxy = event_loop.create_proxy();
     {
@@ -183,7 +184,16 @@ impl App {
         let attrs = Window::default_attributes()
             .with_title("Silkscreen")
             .with_inner_size(winit::dpi::LogicalSize::new(1180.0, 760.0))
-            .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 420.0));
+            .with_min_inner_size(winit::dpi::LogicalSize::new(640.0, 420.0))
+            .with_window_icon(window_icon());
+        // Wayland compositors take the icon from the desktop entry with this
+        // app id (installed by the platform layer), not from the window.
+        #[cfg(target_os = "linux")]
+        let attrs = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+            attrs,
+            "silkscreen",
+            "silkscreen",
+        );
         let window = Arc::new(el.create_window(attrs)?);
         let renderer = Renderer::new(window.clone(), self.opts.vsync)?;
         let egui = egui_winit::State::new(
@@ -767,4 +777,10 @@ impl ApplicationHandler<UiEvent> for App {
             }
         }
     }
+}
+
+/// The app icon for the title bar and taskbar (64x64 RGBA from assets/).
+fn window_icon() -> Option<winit::window::Icon> {
+    let rgba = include_bytes!("../../../../assets/icon-64.rgba");
+    winit::window::Icon::from_rgba(rgba.to_vec(), 64, 64).ok()
 }

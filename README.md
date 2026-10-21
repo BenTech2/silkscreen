@@ -31,7 +31,7 @@ Grab the file for your system from the [Releases](https://github.com/BenTech2/si
 | System | File | Install |
 |---|---|---|
 | Windows 10/11 (x64) | `silkscreen-windows-x64.zip` | Unzip anywhere, run `silkscreen.exe`. Allow it on *Private* networks when the firewall asks. |
-| macOS 12.3+ (Apple Silicon) | `silkscreen-macos-arm64.zip` | Unzip, then run `xattr -dr com.apple.quarantine silkscreen-macos-arm64` once (the build isn't notarized) and start `silkscreen`. |
+| macOS 12.3+ (Apple Silicon) | `silkscreen-macos-arm64.zip` | Unzip, then run `xattr -dr com.apple.quarantine silkscreen-macos-arm64` once (the build isn't notarized) and open `Silkscreen.app`. From a terminal: `Silkscreen.app/Contents/MacOS/silkscreen`. |
 | Linux x86_64 | `silkscreen-linux-x86_64.tar.gz` | `tar xf` it and run `./silkscreen`. Bundles its own FFmpeg; needs glibc 2.36+ (Debian 12, Ubuntu 22.10, Fedora 37 or newer) and PipeWire. |
 | Raspberry Pi 4 / 5 (64-bit Raspberry Pi OS) | `silkscreen-linux-aarch64.tar.gz` | Same as Linux. Best as a **display**: the Pi 4 decodes H.264 in hardware, the Pi 5 in software (fine at 1080p60). |
 | Android 11+ phones and tablets | `silkscreen-android.apk` | Install the APK (allow installs from your browser/file manager). Display only. |
