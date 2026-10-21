@@ -68,12 +68,39 @@ pub fn open_screen(req: &ScreenRequest) -> Result<Screen> {
             "existing display"
         }
     );
+    // ScreenCaptureKit scales to the size asked for, even to another shape.
+    // An existing screen keeps its own: the largest size that fits.
+    let fitted;
+    let req = if guard.is_none() {
+        let b = CGDisplayBounds(display_id).size;
+        let scale = (req.width as f64 / b.width).min(req.height as f64 / b.height);
+        fitted = ScreenRequest {
+            width: ((b.width * scale).round() as u32).max(2) & !1,
+            height: ((b.height * scale).round() as u32).max(2) & !1,
+            ..req.clone()
+        };
+        &fitted
+    } else {
+        req
+    };
     let capturer = capture::SckCapturer::start(display_id, req, guard)?;
     Ok(Screen {
         capturer: Box::new(capturer),
         input: Box::new(input::MacInput::new(display_id)),
         description,
     })
+}
+
+pub fn monitor_list() -> Vec<crate::MonitorInfo> {
+    let main = CGMainDisplayID();
+    active_displays()
+        .into_iter()
+        .map(|id| crate::MonitorInfo {
+            id: id.to_string(),
+            description: describe(id),
+            main: id == main,
+        })
+        .collect()
 }
 
 pub fn diagnostics() -> Vec<(String, String)> {

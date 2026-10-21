@@ -1,14 +1,15 @@
 name: Release
 
-# Builds what can only be built on GitHub's runners (macOS) and attaches it
-# to a published release. The other assets are built with scripts/.
+# Builds the macOS app and the Linux / Raspberry Pi bundles and attaches them
+# to a published release. The Windows zip and the Android APK are built with
+# scripts/ (package-windows.sh, build-android.sh) and uploaded by hand.
 on:
   release:
     types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to attach the macOS build to
+        description: Release tag to attach the builds to
         required: true
 
 permissions:
@@ -21,6 +22,7 @@ jobs:
       TAG: ${{ github.event.release.tag_name || inputs.tag }}
     steps:
       - uses: actions/checkout@v4
+      - run: scripts/fetch-submodules.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: brew install ffmpeg pkg-config dylibbundler
       - run: cargo build --release -p silkscreen
@@ -32,11 +34,11 @@ jobs:
           cp target/release/silkscreen "$app/MacOS/"
           # Copy Homebrew's FFmpeg and its dependencies into the bundle.
           dylibbundler -od -b -x "$app/MacOS/silkscreen" -d "$app/Frameworks" -p @executable_path/../Frameworks/
-          # App icon from the PNGs rendered by scripts/render-icons.sh.
+          # App icon (on Apple's icon grid) rendered by scripts/render-icons.sh.
           set=$RUNNER_TEMP/silkscreen.iconset && mkdir -p "$set"
           for s in 16 32 128 256 512; do
-            cp assets/png/icon-$s.png "$set/icon_${s}x${s}.png"
-            cp assets/png/icon-$((s * 2)).png "$set/icon_${s}x${s}@2x.png"
+            cp assets/png/macos/icon-$s.png "$set/icon_${s}x${s}.png"
+            cp assets/png/macos/icon-$((s * 2)).png "$set/icon_${s}x${s}@2x.png"
           done
           iconutil -c icns "$set" -o "$app/Resources/silkscreen.icns"
           version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "silkscreen") | .version')
@@ -44,9 +46,29 @@ jobs:
           # Rewriting load paths invalidates signatures; Apple Silicon needs one.
           for f in "$app"/Frameworks/*.dylib; do codesign --force -s - "$f"; done
           codesign --force -s - "$out/Silkscreen.app"
-          cp README.md "$out/"
+          cp README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md "$out/"
+          cp third_party/pyrowave/LICENSE "$out/PYROWAVE-LICENSE.txt"
           "$app/MacOS/silkscreen" doctor
           (cd dist && zip -qry silkscreen-macos-arm64.zip silkscreen-macos-arm64)
       - run: gh release upload "$TAG" dist/silkscreen-macos-arm64.zip --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64]
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - run: scripts/fetch-submodules.sh
+      # The Raspberry Pi (aarch64) bundle builds under emulation.
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.arch == 'aarch64'
+      - run: scripts/package-linux.sh ${{ matrix.arch }}
+      - run: gh release upload "$TAG" dist/silkscreen-linux-${{ matrix.arch }}.tar.gz --clobber
         env:
           GH_TOKEN: ${{ github.token }}

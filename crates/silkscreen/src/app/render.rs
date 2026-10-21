@@ -234,9 +234,62 @@ impl VideoRect {
     }
 }
 
+fn present_mode(modes: &[wgpu::PresentMode], vsync: bool) -> wgpu::PresentMode {
+    if !vsync && modes.contains(&wgpu::PresentMode::Immediate) {
+        wgpu::PresentMode::Immediate
+    } else if modes.contains(&wgpu::PresentMode::Mailbox) {
+        // New frames replace queued ones: no tearing, no queueing delay.
+        wgpu::PresentMode::Mailbox
+    } else {
+        wgpu::PresentMode::Fifo
+    }
+}
+
+/// Picks the graphics API and GPU. On Windows that is Direct3D 12 first:
+/// some Vulkan drivers (older Intel ones, e.g. HD Graphics 620 on a Surface)
+/// crash the process while creating the device. Vulkan is the fallback, and
+/// `WGPU_BACKEND=vulkan|dx12|gl` overrides the choice everywhere.
+fn adapter(
+    window: &Arc<Window>,
+) -> Result<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+    let from_env = wgpu::InstanceDescriptor::new_without_display_handle_from_env();
+    let tries = if cfg!(windows) && std::env::var_os("WGPU_BACKEND").is_none() {
+        vec![wgpu::Backends::DX12, wgpu::Backends::VULKAN]
+    } else {
+        vec![from_env.backends]
+    };
+    let mut last = None;
+    for backends in tries {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            ..wgpu::InstanceDescriptor::new_without_display_handle_from_env()
+        });
+        let surface = match instance.create_surface(window.clone()) {
+            Ok(s) => s,
+            Err(e) => {
+                last = Some(anyhow::anyhow!("creating surface ({backends:?}): {e}"));
+                continue;
+            }
+        };
+        match pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            ..Default::default()
+        })) {
+            Ok(adapter) => return Ok((instance, surface, adapter)),
+            Err(e) => {
+                tracing::info!("no {backends:?} GPU: {e}");
+                last = Some(anyhow::anyhow!("no GPU adapter ({backends:?}): {e}"));
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| anyhow::anyhow!("no GPU adapter")))
+}
+
 pub struct Renderer {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
+    present_modes: Vec<wgpu::PresentMode>,
     pipeline: wgpu::RenderPipeline,
     egui: egui_wgpu::Renderer,
     pub video: Arc<VideoUpload>,
@@ -252,17 +305,7 @@ pub struct UiFrame {
 
 impl Renderer {
     pub fn new(window: Arc<Window>, vsync: bool) -> Result<Self> {
-        let instance =
-            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
-        let surface = instance
-            .create_surface(window.clone())
-            .context("creating surface")?;
-        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: wgpu::PowerPreference::HighPerformance,
-            compatible_surface: Some(&surface),
-            ..Default::default()
-        }))
-        .context("no GPU adapter")?;
+        let (instance, surface, adapter) = adapter(&window)?;
         tracing::info!(
             "GPU: {} ({:?})",
             adapter.get_info().name,
@@ -274,6 +317,8 @@ impl Renderer {
             ..Default::default()
         }))
         .context("creating device")?;
+        tracing::info!("GPU device ready");
+        drop(instance);
 
         let size = window.inner_size();
         let caps = surface.get_capabilities(&adapter);
@@ -284,14 +329,7 @@ impl Renderer {
             .copied()
             .find(|f| !f.is_srgb())
             .unwrap_or(caps.formats[0]);
-        let present_mode = if !vsync && caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            wgpu::PresentMode::Immediate
-        } else if caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            // New frames replace queued ones: no tearing, no queueing delay.
-            wgpu::PresentMode::Mailbox
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        let present_mode = present_mode(&caps.present_modes, vsync);
         tracing::info!("swapchain {format:?}, {present_mode:?}");
         let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
@@ -362,6 +400,7 @@ impl Renderer {
         Ok(Renderer {
             surface,
             config,
+            present_modes: caps.present_modes,
             pipeline,
             egui,
             video: Arc::new(VideoUpload {
@@ -386,38 +425,61 @@ impl Renderer {
         self.surface.configure(&self.video.device, &self.config);
     }
 
+    /// Switches between waiting for vertical sync and presenting immediately.
+    pub fn set_vsync(&mut self, vsync: bool) {
+        let mode = present_mode(&self.present_modes, vsync);
+        if mode != self.config.present_mode {
+            tracing::info!("swapchain {mode:?}");
+            self.config.present_mode = mode;
+            self.surface.configure(&self.video.device, &self.config);
+        }
+    }
+
     pub fn max_texture_side(&self) -> usize {
         self.video.device.limits().max_texture_dimension_2d as usize
     }
 
-    pub fn render(&mut self, ui: Option<UiFrame>) {
+    /// Draws a frame. Returns false if the window is hidden, so the caller
+    /// can stop redrawing (presenting is what normally paces the redraws).
+    pub fn render(&mut self, ui: Option<UiFrame>) -> bool {
         self.video.dirty.store(false, Ordering::Release);
-        let frame = match self.surface.get_current_texture() {
-            wgpu::CurrentSurfaceTexture::Success(f)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
-                self.surface.configure(&self.video.device, &self.config);
-                return;
-            }
-            _ => return,
-        };
-        let view = frame.texture.create_view(&Default::default());
-        let mut enc = self
-            .video
-            .device
-            .create_command_encoder(&Default::default());
         let (device, queue) = (&self.video.device, &self.video.queue);
-        let screen = egui_wgpu::ScreenDescriptor {
-            size_in_pixels: [self.config.width, self.config.height],
-            pixels_per_point: ui.as_ref().map_or(1.0, |u| u.pixels_per_point),
-        };
-        let mut extra = Vec::new();
+        // Upload texture changes even if this frame can't be drawn: egui
+        // sends each one once (the font atlas only on the first frame), and
+        // macOS often has no surface texture for a new window's first frame.
         if let Some(ui) = &ui {
             for (id, deltas) in &ui.textures.set {
                 for delta in deltas {
                     self.egui.update_texture(device, queue, *id, delta);
                 }
             }
+        }
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(f)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(f) => f,
+            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                self.surface.configure(&self.video.device, &self.config);
+                self.free_textures(ui);
+                return true;
+            }
+            // Hidden (covered, minimised, screen locked): nothing to draw
+            // into, and no refresh to wait for.
+            _ => {
+                self.free_textures(ui);
+                return false;
+            }
+        };
+        let view = frame.texture.create_view(&Default::default());
+        let mut enc = self
+            .video
+            .device
+            .create_command_encoder(&Default::default());
+        let screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: ui.as_ref().map_or(1.0, |u| u.pixels_per_point),
+        };
+        let mut extra = Vec::new();
+        if let Some(ui) = &ui {
             extra = self
                 .egui
                 .update_buffers(device, queue, &mut enc, &ui.primitives, &screen);
@@ -462,6 +524,11 @@ impl Renderer {
         extra.push(enc.finish());
         self.video.queue.submit(extra);
         self.video.queue.present(frame);
+        self.free_textures(ui);
+        true
+    }
+
+    fn free_textures(&mut self, ui: Option<UiFrame>) {
         if let Some(ui) = ui {
             for id in &ui.textures.free {
                 self.egui.free_texture(id);

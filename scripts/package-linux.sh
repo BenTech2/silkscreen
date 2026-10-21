@@ -31,7 +31,7 @@ ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpe
     -w /src "$image" bash -euo pipefail -c '
         apt-get update -qq
         apt-get install -y -qq --no-install-recommends \
-            ca-certificates curl xz-utils build-essential clang libclang-dev pkg-config \
+            ca-certificates curl xz-utils build-essential clang libclang-dev pkg-config cmake \
             libpipewire-0.3-dev >/dev/null
         [ -x /cargo/bin/cargo ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal >/dev/null
         export PATH=/cargo/bin:$PATH
@@ -52,7 +52,12 @@ ffmpeg_url="https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpe
         strip $out/silkscreen
         # Only what the binary loads: avcodec (+ swresample) and avutil.
         for lib in avcodec avutil swresample; do cp -a $ff/lib/lib$lib.so* $out/lib/; done
-        cp /src/README.md $out/
+        # PyroWave (experimental codec), unless built with --no-default-features.
+        for lib in $target/release/libpyrowave-shared.so*; do
+            [ -f "$lib" ] && cp -a "$lib" $out/lib/ && cp /src/third_party/pyrowave/LICENSE $out/PYROWAVE-LICENSE.txt
+        done
+        cp /src/README.md /src/LICENSE-MIT /src/LICENSE-APACHE /src/THIRD-PARTY-NOTICES.md \
+            /src/THIRD-PARTY-LICENSES.md $out/
         [ -f $ff/LICENSE.txt ] && cp $ff/LICENSE.txt $out/FFMPEG-LICENSE.txt
         cd /src/dist && tar czf silkscreen-linux-$ARCH.tar.gz silkscreen-linux-$ARCH
         echo "built dist/silkscreen-linux-$ARCH.tar.gz"

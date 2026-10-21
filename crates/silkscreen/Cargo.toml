@@ -34,6 +34,18 @@ egui-wgpu = "0.37"
 egui-winit = "0.37"
 serde = { version = "1.0.229", features = ["derive"] }
 postcard = { version = "1.1.3", features = ["use-std"] }
+# ksni: the Linux tray talks D-Bus directly, no GTK/libappindicator needed.
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
+
+[features]
+default = ["pyrowave"]
+# The experimental PyroWave codec (see crates/silkscreen-codec/build.rs).
+pyrowave = ["silkscreen-codec/pyrowave"]
 
 [build-dependencies]
 embed-resource = "3.0.12"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.5"
+objc2-app-kit = { version = "0.3.2", features = ["NSApplication", "NSImage", "NSRunningApplication"] }
+objc2-foundation = { version = "0.3.2", features = ["NSData"] }

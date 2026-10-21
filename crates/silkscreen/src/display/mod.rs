@@ -3,11 +3,11 @@
 //! display lives in the GUI ([`crate::app`]); the network service is shared
 //! with Android in `silkscreen-core`.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use silkscreen_codec::{Decoder, Picture};
 use silkscreen_core::display::DisplayRole;
 use silkscreen_core::service::FrameSink;
@@ -26,7 +26,7 @@ pub trait PictureSink: Send + Sync {
 /// Decodes with FFmpeg (hardware where possible) into a [`PictureSink`].
 pub struct DecodingSink {
     out: Arc<dyn PictureSink>,
-    hw: bool,
+    hw: AtomicBool,
     decoder: Mutex<Option<ActiveDecoder>>,
 }
 
@@ -34,26 +34,53 @@ struct ActiveDecoder {
     decoder: Decoder,
     cfg: StreamConfig,
     errors: u32,
+    /// The decoder was swapped mid-stream and can only start at a keyframe.
+    wait_key: bool,
 }
 
 impl DecodingSink {
     pub fn new(out: Arc<dyn PictureSink>, hw: bool) -> Arc<Self> {
         Arc::new(DecodingSink {
             out,
-            hw,
+            hw: AtomicBool::new(hw),
             decoder: Mutex::new(None),
         })
+    }
+
+    /// The decoder in use, if a stream is running.
+    pub fn decoder_name(&self) -> Option<String> {
+        let guard = self.decoder.lock().unwrap();
+        guard.as_ref().map(|a| a.decoder.name().to_owned())
+    }
+
+    /// Switches hardware decoding on or off, mid-stream if one is running.
+    pub fn set_hw_decode(&self, hw: bool) {
+        if self.hw.swap(hw, Ordering::Relaxed) == hw {
+            return;
+        }
+        if let Some(a) = self.decoder.lock().unwrap().as_mut() {
+            match Decoder::open(a.cfg.codec, hw) {
+                Ok(d) => {
+                    info!("decoding with {}", d.name());
+                    a.decoder = d;
+                    a.errors = 0;
+                    a.wait_key = true;
+                }
+                Err(e) => warn!("cannot switch decoder: {e:#}"),
+            }
+        }
     }
 }
 
 impl FrameSink for DecodingSink {
     fn start(&self, cfg: &StreamConfig, host: &str) -> Result<String> {
-        let decoder = Decoder::open(cfg.codec, self.hw)?;
+        let decoder = Decoder::open(cfg.codec, self.hw.load(Ordering::Relaxed))?;
         let name = decoder.name().to_owned();
         *self.decoder.lock().unwrap() = Some(ActiveDecoder {
             decoder,
             cfg: cfg.clone(),
             errors: 0,
+            wait_key: false,
         });
         self.out.stream_started(cfg, host);
         Ok(name)
@@ -62,6 +89,13 @@ impl FrameSink for DecodingSink {
     fn frame(&self, frame: &EncodedFrame) -> Result<()> {
         let mut guard = self.decoder.lock().unwrap();
         let a = guard.as_mut().context("no stream")?;
+        if a.wait_key {
+            if !frame.keyframe {
+                // The error makes the service ask the host for a keyframe.
+                bail!("switched decoder; waiting for a keyframe");
+            }
+            a.wait_key = false;
+        }
         match a.decoder.decode(&frame.data) {
             Ok(Some(pic)) => {
                 a.errors = 0;
@@ -71,7 +105,7 @@ impl FrameSink for DecodingSink {
             Ok(None) => Ok(()),
             Err(e) => {
                 a.errors += 1;
-                if a.errors >= 3 && self.hw {
+                if a.errors >= 3 && self.hw.load(Ordering::Relaxed) {
                     // Hardware decoders can reject streams (e.g. beyond their
                     // max resolution); software always works.
                     warn!("falling back to software decoding");
@@ -98,6 +132,8 @@ pub struct DisplayOptions {
     pub hw_decode: bool,
     /// Fixed pairing code instead of a random one (tests).
     pub fixed_code: Option<String>,
+    /// Skip ahead when this far behind the host (see `set_catch_up`).
+    pub catch_up: Option<Duration>,
 }
 
 impl Default for DisplayOptions {
@@ -106,6 +142,7 @@ impl Default for DisplayOptions {
             port: DEFAULT_CONTROL_PORT,
             hw_decode: true,
             fixed_code: None,
+            catch_up: None,
         }
     }
 }
@@ -177,6 +214,7 @@ pub fn run_headless(opts: DisplayOptions, ctx: Arc<Ctx>, spec: HeadlessSpec) -> 
         caps,
         DecodingSink::new(sink.clone(), opts.hw_decode),
     )?;
+    role.service.set_catch_up(opts.catch_up);
     let started = Instant::now();
     let mut total = 0u64;
     loop {

@@ -18,6 +18,10 @@ pub enum Codec {
     H264,
     Hevc,
     Av1,
+    /// PyroWave: an intra-only wavelet codec on the GPU (Vulkan or Metal).
+    /// Every frame stands alone; needs a few hundred Mbit/s (Ethernet).
+    /// Experimental.
+    PyroWave,
 }
 
 impl Codec {
@@ -26,6 +30,7 @@ impl Codec {
             Codec::H264 => "h264",
             Codec::Hevc => "hevc",
             Codec::Av1 => "av1",
+            Codec::PyroWave => "pyrowave",
         }
     }
 }

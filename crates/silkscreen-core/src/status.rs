@@ -79,4 +79,8 @@ pub struct DisplayState {
     pub latency_ms: f32,
     pub frames_dropped: u32,
     pub packets_lost: u32,
+    /// How far behind the host the picture is (worst in the last second).
+    pub behind_ms: f32,
+    /// Times this display skipped ahead to catch up.
+    pub catch_ups: u32,
 }

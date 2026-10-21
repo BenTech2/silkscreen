@@ -1,0 +1,6 @@
+[submodule "third_party/pyrowave"]
+	path = third_party/pyrowave
+	url = https://github.com/Themaister/pyrowave.git
+[submodule "third_party/granite"]
+	path = third_party/granite
+	url = https://github.com/Themaister/Granite.git
