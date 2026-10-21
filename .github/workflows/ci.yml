@@ -1,0 +1,95 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang pkg-config libavcodec-dev libavformat-dev libavutil-dev \
+            libavfilter-dev libavdevice-dev libswscale-dev libswresample-dev libpipewire-0.3-dev \
+            libdbus-1-dev libxkbcommon-dev libwayland-dev
+      - run: cargo fmt --all --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silkscreen-linux-x64
+          path: target/release/silkscreen
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Fetch FFmpeg (LGPL, shared)
+        shell: pwsh
+        run: |
+          $url = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-win64-lgpl-shared-8.1.zip"
+          Invoke-WebRequest $url -OutFile ffmpeg.zip
+          Expand-Archive ffmpeg.zip -DestinationPath .
+          $dir = (Get-ChildItem -Directory ffmpeg-n8.1-*).FullName
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+      - run: cargo test -p silkscreen-proto
+      - run: cargo build --release
+      - name: Bundle
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist/silkscreen-windows-x64 | Out-Null
+          Copy-Item target/release/silkscreen.exe dist/silkscreen-windows-x64/
+          foreach ($lib in "avcodec", "avutil", "swresample") { Copy-Item "$env:FFMPEG_DIR/bin/$lib-*.dll" dist/silkscreen-windows-x64/ }
+          Copy-Item README.md dist/silkscreen-windows-x64/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silkscreen-windows-x64
+          path: dist/silkscreen-windows-x64
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: brew install ffmpeg pkg-config
+      - run: cargo test
+      - run: cargo build --release
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silkscreen-macos-arm64
+          path: target/release/silkscreen
+
+  android:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, x86_64-linux-android
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+      - uses: nttld/setup-ndk@v1
+        id: ndk
+        with:
+          ndk-version: r28c
+      - run: cargo install cargo-ndk --locked
+      - run: scripts/build-android.sh release
+        env:
+          ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: silkscreen-android
+          path: dist/silkscreen-android.apk

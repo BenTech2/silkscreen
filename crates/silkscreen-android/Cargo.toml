@@ -1,0 +1,24 @@
+[package]
+name = "silkscreen-android"
+description = "Android display for Silkscreen: JNI bindings and MediaCodec decoding"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "silkscreen_android"
+crate-type = ["cdylib"]
+
+[dependencies]
+silkscreen-proto = { path = "../silkscreen-proto" }
+silkscreen-core = { path = "../silkscreen-core" }
+anyhow = "1.0.104"
+tracing = "0.1.44"
+serde_json = "1.0.154"
+tracing-subscriber = "0.3.23"
+serde = { version = "1.0.229", features = ["derive"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+jni = "0.21"
+ndk = { version = "0.9.0", features = ["media", "nativewindow", "api-level-30"] }
+paranoid-android = "0.2.2"
