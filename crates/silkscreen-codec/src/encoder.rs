@@ -47,6 +47,7 @@ pub fn candidates(codec: Codec) -> Vec<&'static str> {
         Codec::Hevc => &["hevc_videotoolbox"],
         #[cfg(target_os = "macos")]
         Codec::Av1 => &[],
+        Codec::PyroWave => &[],
         #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
         _ => &[],
     };
@@ -54,6 +55,7 @@ pub fn candidates(codec: Codec) -> Vec<&'static str> {
         Codec::H264 => &["libx264", "libopenh264"],
         Codec::Hevc => &["libx265"],
         Codec::Av1 => &["libsvtav1"],
+        Codec::PyroWave => &[],
     };
     hw.iter().chain(sw).copied().collect()
 }
@@ -118,7 +120,8 @@ enum Input {
     Upload { frames: BufRef, hw_frame: Frame },
 }
 
-pub struct Encoder {
+/// An FFmpeg encoder.
+struct FfEncoder {
     ctx: CodecCtx,
     name: String,
     chroma: ChromaLayout,
@@ -130,10 +133,10 @@ pub struct Encoder {
 }
 
 // Each encoder is driven by a single thread at a time.
-unsafe impl Send for Encoder {}
+unsafe impl Send for FfEncoder {}
 
-impl Encoder {
-    pub fn open(cfg: &EncoderConfig) -> Result<Self> {
+impl FfEncoder {
+    fn open(cfg: &EncoderConfig) -> Result<Self> {
         init_logging();
         if !cfg.width.is_multiple_of(2) || !cfg.height.is_multiple_of(2) {
             bail!(
@@ -275,7 +278,7 @@ impl Encoder {
             f.color_trc = c.color_trc;
             check(ff::av_frame_get_buffer(frame.0, 64), "av_frame_get_buffer")?;
 
-            Ok(Encoder {
+            Ok(FfEncoder {
                 ctx,
                 name: name.to_owned(),
                 chroma,
@@ -465,6 +468,13 @@ unsafe fn supported_pix_fmts(codec: *const ff::AVCodec) -> Vec<Pix> {
 /// Names of every encoder in [`candidates`] that this FFmpeg build contains
 /// (not necessarily usable on this machine's hardware).
 pub fn compiled_encoders(codec: Codec) -> Vec<&'static str> {
+    if codec == Codec::PyroWave {
+        #[cfg(feature = "pyrowave")]
+        if crate::pyrowave::available() {
+            return vec![crate::pyrowave::ENCODER_NAME];
+        }
+        return Vec::new();
+    }
     candidates(codec)
         .into_iter()
         .filter(|n| {
@@ -489,8 +499,86 @@ pub fn default_bitrate_kbps(codec: Codec, width: u32, height: u32, refresh_mhz: 
         Codec::H264 => 0.10,
         Codec::Hevc => 0.07,
         Codec::Av1 => 0.06,
+        #[cfg(feature = "pyrowave")]
+        Codec::PyroWave => {
+            return crate::pyrowave::default_bitrate_kbps(width, height, refresh_mhz);
+        }
+        #[cfg(not(feature = "pyrowave"))]
+        Codec::PyroWave => 1.0,
     };
     let fps = refresh_mhz as f64 / 1000.0;
     let kbps = width as f64 * height as f64 * fps * bits_per_pixel / 1000.0;
     (kbps as u32).clamp(5_000, 200_000)
+}
+
+/// A video encoder: FFmpeg's, or PyroWave.
+pub struct Encoder(Backend);
+
+enum Backend {
+    Ff(FfEncoder),
+    #[cfg(feature = "pyrowave")]
+    PyroWave(crate::pyrowave::PyroEncoder),
+}
+
+impl Encoder {
+    pub fn open(cfg: &EncoderConfig) -> Result<Self> {
+        if cfg.codec == Codec::PyroWave {
+            #[cfg(feature = "pyrowave")]
+            return Ok(Encoder(Backend::PyroWave(
+                crate::pyrowave::PyroEncoder::open(cfg)?,
+            )));
+            #[cfg(not(feature = "pyrowave"))]
+            bail!("this build of Silkscreen has no PyroWave");
+        }
+        Ok(Encoder(Backend::Ff(FfEncoder::open(cfg)?)))
+    }
+
+    pub fn name(&self) -> &str {
+        match &self.0 {
+            Backend::Ff(e) => e.name(),
+            #[cfg(feature = "pyrowave")]
+            Backend::PyroWave(e) => e.name(),
+        }
+    }
+
+    /// Encodes one captured frame. `emit` is called for each output packet
+    /// with `(bitstream, is_keyframe)`; with the low-latency settings that
+    /// is exactly once per input frame.
+    pub fn encode(
+        &mut self,
+        src: &RgbFrame,
+        pts_us: u64,
+        force_keyframe: bool,
+        emit: impl FnMut(&[u8], bool),
+    ) -> Result<()> {
+        match &mut self.0 {
+            Backend::Ff(e) => e.encode(src, pts_us, force_keyframe, emit),
+            #[cfg(feature = "pyrowave")]
+            Backend::PyroWave(e) => e.encode(src, emit),
+        }
+    }
+
+    /// Re-encodes the previous frame. Used to answer a keyframe request when
+    /// the screen is static and no new frame is coming.
+    pub fn encode_again(
+        &mut self,
+        pts_us: u64,
+        force_keyframe: bool,
+        emit: impl FnMut(&[u8], bool),
+    ) -> Result<()> {
+        match &mut self.0 {
+            Backend::Ff(e) => e.encode_again(pts_us, force_keyframe, emit),
+            #[cfg(feature = "pyrowave")]
+            Backend::PyroWave(e) => e.encode_again(emit),
+        }
+    }
+
+    /// Emits packets an asynchronous encoder finished since the last call.
+    pub fn poll(&mut self, emit: impl FnMut(&[u8], bool)) -> Result<()> {
+        match &mut self.0 {
+            Backend::Ff(e) => e.poll(emit),
+            #[cfg(feature = "pyrowave")]
+            Backend::PyroWave(_) => Ok(()),
+        }
+    }
 }

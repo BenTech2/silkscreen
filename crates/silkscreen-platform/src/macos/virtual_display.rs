@@ -25,6 +25,17 @@ unsafe extern "C" {
     fn dispatch_get_global_queue(identifier: isize, flags: usize) -> *mut AnyObject;
 }
 
+/// A serial number per display name: macOS tells virtual displays apart
+/// (and remembers each one's arrangement) by vendor, product and serial, so
+/// several at once need different ones, and the same one each time.
+fn serial(name: &str) -> u32 {
+    // FNV-1a; never 0, which macOS treats as "no serial".
+    let h = name.bytes().fold(0x811c_9dc5u32, |h, b| {
+        (h ^ b as u32).wrapping_mul(0x0100_0193)
+    });
+    h.max(1)
+}
+
 pub struct VirtualDisplay {
     /// Released on drop, which unplugs the display.
     _display: Retained<AnyObject>,
@@ -63,7 +74,7 @@ impl VirtualDisplay {
                 msg_send![&*desc, setSizeInMillimeters: CGSize { width: mm_w, height: mm_h }];
             let _: () = msg_send![&*desc, setVendorID: 0x5153u32]; // "SS"
             let _: () = msg_send![&*desc, setProductID: 0x0001u32];
-            let _: () = msg_send![&*desc, setSerialNum: 0x0001u32];
+            let _: () = msg_send![&*desc, setSerialNum: serial(&req.name)];
             let queue = dispatch_get_global_queue(0, 0);
             let _: () = msg_send![&*desc, setQueue: queue];
 

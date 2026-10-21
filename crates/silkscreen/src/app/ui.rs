@@ -12,6 +12,8 @@ use egui::{Align, Color32, Layout, RichText, Ui};
 use silkscreen_proto::{Codec, PROTOCOL_VERSION};
 use tracing::Level;
 
+use super::MIN_DATAGRAM_LEN;
+use super::prefs::{Prefs, SourceChoice};
 use crate::ctx::{Ctx, KeepAwake};
 use crate::discovery::FoundDisplay;
 use crate::logbuf;
@@ -29,45 +31,28 @@ pub enum Tab {
     Debug,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SourceChoice {
-    Virtual,
-    Monitor,
-    TestPattern,
-}
-
 /// Editable UI state that persists between frames.
 pub struct UiState {
     pub tab: Tab,
     pub name_edit: String,
     pub manual_addr: String,
     pub code_input: String,
-    pub source: SourceChoice,
-    pub monitor_name: String,
-    pub codec: Option<Codec>,
-    /// 0 = automatic.
-    pub bitrate_mbps: f32,
-    pub resolution: crate::host::Resolution,
-    pub display_windowed: bool,
+    /// Display and stream options; the app saves them when they change.
+    pub prefs: Prefs,
     pub log_level: Level,
     pub log_filter: String,
     pub diagnostics: Option<Vec<(String, String)>>,
 }
 
 impl UiState {
-    pub fn new(name: String, windowed: bool) -> Self {
+    pub fn new(name: String, prefs: Prefs, log_level: Level) -> Self {
         UiState {
             tab: Tab::Home,
             name_edit: name,
             manual_addr: String::new(),
             code_input: String::new(),
-            source: SourceChoice::Virtual,
-            monitor_name: String::new(),
-            codec: None,
-            bitrate_mbps: 0.0,
-            resolution: crate::host::Resolution::Auto,
-            display_windowed: windowed,
-            log_level: Level::INFO,
+            prefs,
+            log_level,
             log_filter: String::new(),
             diagnostics: None,
         }
@@ -78,10 +63,13 @@ impl UiState {
 pub enum Action {
     StartDisplay,
     StopDisplay,
-    Connect(String),
-    SubmitCode(String),
-    StopHost,
-    DismissHost,
+    /// A display (name or address), and whether to mirror instead of extend.
+    Connect(String, bool),
+    /// Index into [`View::hosts`].
+    SubmitCode(usize, String),
+    StopHost(usize),
+    StopAllHosts,
+    DismissHost(usize),
     Forget(String),
     Rename(String),
     ToggleOverlay,
@@ -92,10 +80,15 @@ pub enum Action {
 pub struct View<'a> {
     pub ctx: &'a Ctx,
     pub displays: Vec<FoundDisplay>,
-    pub host: Option<HostState>,
+    /// Host sessions as `(target, mirroring, state)`, one per display.
+    pub hosts: Vec<(String, bool, HostState)>,
+    /// This computer's screens, for Mirror.
+    pub screens: &'a [silkscreen_platform::MonitorInfo],
     pub display: Option<DisplayState>,
     pub local_ips: &'a [IpAddr],
     pub monitor: String,
+    /// Every monitor of this computer, in the system's order.
+    pub monitors: Vec<String>,
     pub overlay: bool,
     /// The screen is being kept awake right now.
     pub awake: bool,
@@ -134,36 +127,84 @@ fn card(ui: &mut Ui, title: &str, add: impl FnOnce(&mut Ui)) {
 // ---------------------------------------------------------------------------
 // Home
 
+/// The app icon as a texture, uploaded once (raw RGBA from assets/: no
+/// image decoder needed).
+fn icon_texture(
+    ctx: &egui::Context,
+    name: &'static str,
+    rgba: &[u8],
+    size: usize,
+) -> egui::TextureHandle {
+    let id = egui::Id::unique(name);
+    if let Some(t) = ctx.data(|d| d.get_temp::<egui::TextureHandle>(id)) {
+        return t;
+    }
+    let image = egui::ColorImage::from_rgba_unmultiplied([size, size], rgba);
+    let t = ctx.load_texture(name, image, egui::TextureOptions::LINEAR);
+    ctx.data_mut(|d| d.insert_temp(id, t.clone()));
+    t
+}
+
+/// For the header.
+fn app_icon(ctx: &egui::Context) -> egui::TextureHandle {
+    let rgba = include_bytes!("../../../../assets/icon-64.rgba");
+    icon_texture(ctx, "app-icon-64", rgba, 64)
+}
+
+/// Side margin shared by the header and the page, so they line up.
+const PAGE_MARGIN: i8 = 14;
+
 pub fn home(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action>) {
-    egui::Panel::top("top").show(ui, |ui| {
-        ui.add_space(6.0);
-        ui.horizontal(|ui| {
-            ui.label(
-                RichText::new("Silkscreen")
-                    .size(22.0)
-                    .strong()
-                    .color(ACCENT),
-            );
-            ui.add_space(16.0);
-            ui.selectable_value(&mut st.tab, Tab::Home, RichText::new("Home").size(15.0));
-            ui.selectable_value(&mut st.tab, Tab::Debug, RichText::new("Debug").size(15.0));
-            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                ui.label(
-                    RichText::new(v.ctx.identity.fingerprint())
-                        .monospace()
-                        .weak(),
-                )
-                .on_hover_text("This device's key fingerprint — compare it when pairing");
-                let r = ui.add(egui::TextEdit::singleline(&mut st.name_edit).desired_width(180.0));
-                if r.lost_focus() && st.name_edit.trim() != v.ctx.name() {
-                    actions.push(Action::Rename(st.name_edit.clone()));
+    // Darker than the page, lighter than text boxes (so they still show).
+    let header = egui::Frame::new()
+        .fill(ui.visuals().panel_fill.gamma_multiply(0.75))
+        .inner_margin(egui::Margin::symmetric(PAGE_MARGIN, 0));
+    egui::Panel::top("top")
+        .exact_size(54.0)
+        .frame(header)
+        .show(ui, |ui| {
+            // Everything vertically centred in the bar.
+            ui.horizontal_centered(|ui| {
+                let icon = app_icon(ui.ctx());
+                ui.add(egui::Image::new((icon.id(), egui::vec2(28.0, 28.0))));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Silkscreen").size(19.0).strong());
+                ui.add_space(18.0);
+                for (tab, name) in [(Tab::Home, "Home"), (Tab::Debug, "Debug")] {
+                    let b = egui::Button::selectable(st.tab == tab, RichText::new(name).size(14.0))
+                        .min_size(egui::vec2(68.0, 28.0))
+                        .corner_radius(6.0);
+                    if ui.add(b).clicked() {
+                        st.tab = tab;
+                    }
                 }
-                ui.label("This computer:");
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(v.ctx.identity.fingerprint())
+                            .monospace()
+                            .weak(),
+                    )
+                    .on_hover_text("This device's key fingerprint — compare it when pairing");
+                    let r = ui.add(
+                        egui::TextEdit::singleline(&mut st.name_edit)
+                            .desired_width(180.0)
+                            .align(egui::Align2::LEFT_CENTER)
+                            .min_size(egui::vec2(0.0, 28.0)),
+                    );
+                    if r.lost_focus() && st.name_edit.trim() != v.ctx.name() {
+                        actions.push(Action::Rename(st.name_edit.clone()));
+                    }
+                    ui.label(RichText::new("This computer").weak());
+                });
             });
         });
-        ui.add_space(4.0);
+    let page = egui::Frame::central_panel(ui.style()).inner_margin(egui::Margin {
+        left: PAGE_MARGIN,
+        right: PAGE_MARGIN,
+        top: 12,
+        bottom: 8,
     });
-    egui::CentralPanel::default().show(ui, |ui| {
+    egui::CentralPanel::default().frame(page).show(ui, |ui| {
         egui::ScrollArea::vertical()
             .auto_shrink(false)
             .show(ui, |ui| match st.tab {
@@ -182,10 +223,11 @@ fn home_tab(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action>) 
             );
             ui.label(RichText::new(&v.monitor).weak());
             ui.checkbox(
-                &mut st.display_windowed,
+                &mut st.prefs.display.windowed,
                 "Run in a window instead of fullscreen",
             );
             keep_awake_setting(ui, v, actions);
+            display_options(ui, st, v);
             ui.add_space(6.0);
             if ui
                 .add(
@@ -211,6 +253,8 @@ fn home_tab(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action>) 
             display_card(&mut cols[0], st, actions);
             cols[0].add_space(8.0);
             paired_card(&mut cols[0], v, actions);
+            cols[0].add_space(8.0);
+            app_card(&mut cols[0], st);
             extend_card(&mut cols[1], st, v, actions);
         });
     } else {
@@ -219,7 +263,51 @@ fn home_tab(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action>) 
         extend_card(ui, st, v, actions);
         ui.add_space(8.0);
         paired_card(ui, v, actions);
+        ui.add_space(8.0);
+        app_card(ui, st);
     }
+}
+
+fn app_card(ui: &mut Ui, st: &mut UiState) {
+    use super::prefs::LoginStart;
+    let a = &mut st.prefs.app;
+    let (tray, place) = if cfg!(target_os = "macos") {
+        ("Show Silkscreen in the menu bar", "menu bar")
+    } else {
+        ("Show Silkscreen in the system tray", "tray")
+    };
+    card(ui, "App", |ui| {
+        ui.checkbox(&mut a.tray, tray).on_hover_text(format!(
+            "Closing the window then keeps Silkscreen running in the {place}, \
+             connections included. Use its icon to reopen the window, disconnect or quit."
+        ));
+        ui.checkbox(&mut a.start_at_login, "Start Silkscreen when I log in");
+        if a.start_at_login {
+            let label = |l: LoginStart| match l {
+                LoginStart::Window => "Open the window".to_owned(),
+                LoginStart::Tray => format!("Stay in the {place}"),
+                LoginStart::Display => "Start display mode".to_owned(),
+            };
+            ui.horizontal(|ui| {
+                ui.label("When it starts:");
+                egui::ComboBox::from_id_salt("login-start")
+                    .selected_text(label(a.login_start))
+                    .show_ui(ui, |ui| {
+                        for l in [LoginStart::Window, LoginStart::Tray, LoginStart::Display] {
+                            ui.selectable_value(&mut a.login_start, l, label(l));
+                        }
+                    });
+            });
+            if a.login_start == LoginStart::Tray && !a.tray {
+                ui.label(
+                    RichText::new(format!(
+                        "Turn on the {place} icon for this; until then the window opens."
+                    ))
+                    .color(WARN),
+                );
+            }
+        }
+    });
 }
 
 fn keep_awake_setting(ui: &mut Ui, v: &View, actions: &mut Vec<Action>) {
@@ -262,16 +350,98 @@ fn keep_awake_setting(ui: &mut Ui, v: &View, actions: &mut Vec<Action>) {
     }
 }
 
+fn display_options(ui: &mut Ui, st: &mut UiState, v: &View) {
+    let d = &mut st.prefs.display;
+    egui::CollapsingHeader::new("Display options").show(ui, |ui| {
+        egui::Grid::new("display-opts")
+            .num_columns(2)
+            .show(ui, |ui| {
+                if v.monitors.len() > 1 || d.monitor.is_some() {
+                    ui.label("Screen");
+                    let label = |i: Option<usize>| match i {
+                        None => "The one this window is on".to_owned(),
+                        Some(i) => v
+                            .monitors
+                            .get(i)
+                            .cloned()
+                            .unwrap_or_else(|| format!("Monitor {} (not connected)", i + 1)),
+                    };
+                    egui::ComboBox::from_id_salt("display-monitor")
+                        .selected_text(label(d.monitor))
+                        .show_ui(ui, |ui| {
+                            ui.selectable_value(&mut d.monitor, None, label(None));
+                            for i in 0..v.monitors.len() {
+                                ui.selectable_value(&mut d.monitor, Some(i), label(Some(i)));
+                            }
+                        })
+                        .response
+                        .on_hover_text("Which of this computer's screens becomes the display");
+                    ui.end_row();
+                }
+                ui.label("Port");
+                ui.add(egui::DragValue::new(&mut d.port).range(1024..=65535))
+                    .on_hover_text(format!(
+                        "TCP port hosts connect to (default {}). Hosts find it automatically; \
+                     when connecting by address, add it as 192.168.1.20:PORT.",
+                        silkscreen_proto::DEFAULT_CONTROL_PORT
+                    ));
+                ui.end_row();
+            });
+        ui.horizontal(|ui| {
+            ui.label("When the picture falls behind:");
+            let label = |ms: Option<u32>| match ms {
+                None => "Show every frame".to_owned(),
+                Some(ms) => format!("Skip ahead after {ms} ms"),
+            };
+            egui::ComboBox::from_id_salt("skip-behind")
+                .selected_text(label(d.skip_behind_ms))
+                .show_ui(ui, |ui| {
+                    for ms in [None, Some(50), Some(100), Some(150), Some(250), Some(500)] {
+                        ui.selectable_value(&mut d.skip_behind_ms, ms, label(ms));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "On a slow or busy network (Wi-Fi) frames can queue up, and the picture \
+                     drifts further behind the host. Skipping drops the queued frames and \
+                     jumps back to live, at the cost of a skipped moment. Try 150 ms on Wi-Fi.",
+                );
+        });
+        ui.checkbox(&mut d.hw_decode, "Hardware video decoding")
+            .on_hover_text("Turn off if the picture is corrupt or black; software always works");
+        ui.checkbox(&mut d.vsync, "Wait for the screen's refresh (no tearing)")
+            .on_hover_text("Off shows each frame the moment it arrives: lowest latency, may tear");
+        ui.checkbox(
+            &mut d.forward_mouse,
+            "Send this computer's mouse to the host",
+        );
+        ui.checkbox(
+            &mut d.forward_keyboard,
+            "Send this computer's keyboard to the host",
+        );
+        ui.label(RichText::new("Port and screen apply the next time display mode starts.").weak());
+    });
+}
+
 fn extend_card(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action>) {
     card(ui, "Extend this computer to a display", |ui| {
-        if let Some(h) = &v.host {
-            host_status(ui, st, h, actions);
+        let active = |h: &HostState| !matches!(h.phase, HostPhase::Stopped(_));
+        for (i, (_, mirror, h)) in v.hosts.iter().enumerate() {
+            host_status(ui, st, i, *mirror, h, actions);
             ui.separator();
         }
-        let busy = v
-            .host
-            .as_ref()
-            .is_some_and(|h| !matches!(h.phase, HostPhase::Stopped(_)));
+        let connected = v.hosts.iter().filter(|(_, _, h)| active(h)).count();
+        if connected > 1 {
+            ui.horizontal(|ui| {
+                ui.label(format!("Connected to {connected} displays."));
+                if ui.button("Disconnect all").clicked() {
+                    actions.push(Action::StopAllHosts);
+                }
+            });
+            ui.separator();
+        }
+        let busy = connected > 0;
+        let in_use = |target: &str| v.hosts.iter().any(|(t, _, h)| t == target && active(h));
         ui.label(RichText::new("Displays on this network").strong());
         if v.displays.is_empty() {
             ui.horizontal(|ui| {
@@ -285,7 +455,16 @@ fn extend_card(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action
             });
         }
         for d in &v.displays {
-            display_row(ui, d, v, busy, actions);
+            display_row(ui, d, v, in_use(&d.addr.to_string()), actions);
+        }
+        if busy && !v.displays.is_empty() {
+            ui.label(
+                RichText::new(
+                    "Connect more displays too: each extended one gets its own virtual \
+                     monitor; mirrored ones all show the same screen.",
+                )
+                .weak(),
+            );
         }
         ui.add_space(6.0);
         ui.horizontal(|ui| {
@@ -295,96 +474,269 @@ fn extend_card(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action
                     .hint_text("192.168.1.20")
                     .desired_width(160.0),
             );
-            if ui
-                .add_enabled(
-                    !busy && !st.manual_addr.trim().is_empty(),
-                    egui::Button::new("Connect"),
-                )
-                .clicked()
-            {
-                actions.push(Action::Connect(st.manual_addr.trim().to_owned()));
+            let addr = st.manual_addr.trim().to_owned();
+            let ok = !addr.is_empty() && !in_use(&addr);
+            if ui.add_enabled(ok, egui::Button::new("Extend")).clicked() {
+                actions.push(Action::Connect(addr.clone(), false));
+            }
+            if ui.add_enabled(ok, egui::Button::new("Mirror")).clicked() {
+                actions.push(Action::Connect(addr, true));
             }
         });
-        egui::CollapsingHeader::new("Stream options").show(ui, |ui| {
-            egui::Grid::new("opts").num_columns(2).show(ui, |ui| {
-                ui.label("Source");
-                egui::ComboBox::from_id_salt("source")
-                    .selected_text(match st.source {
-                        SourceChoice::Virtual => "New virtual monitor",
-                        SourceChoice::Monitor => "Existing monitor (dummy plug)",
-                        SourceChoice::TestPattern => "Test pattern",
-                    })
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(
-                            &mut st.source,
-                            SourceChoice::Virtual,
-                            "New virtual monitor",
-                        );
-                        ui.selectable_value(
-                            &mut st.source,
-                            SourceChoice::Monitor,
-                            "Existing monitor (dummy plug)",
-                        );
-                        ui.selectable_value(
-                            &mut st.source,
-                            SourceChoice::TestPattern,
-                            "Test pattern",
-                        );
-                    });
-                ui.end_row();
-                if st.source == SourceChoice::Monitor {
-                    ui.label("Monitor");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut st.monitor_name)
-                            .hint_text("auto (the only secondary)"),
-                    );
-                    ui.end_row();
-                }
-                ui.label("Resolution");
-                {
-                    use crate::host::Resolution as R;
-                    let label = |r: R| match r {
-                        R::Auto => "Automatic (half above 4K)",
-                        R::Full => "Full (sharpest, more latency)",
-                        R::Half => "Half (lowest latency)",
-                    };
-                    egui::ComboBox::from_id_salt("resolution")
-                        .selected_text(label(st.resolution))
-                        .show_ui(ui, |ui| {
-                            for r in [R::Auto, R::Full, R::Half] {
-                                ui.selectable_value(&mut st.resolution, r, label(r));
-                            }
-                        });
-                }
-                ui.end_row();
-                ui.label("Codec");
-                egui::ComboBox::from_id_salt("codec")
-                    .selected_text(st.codec.map_or("Automatic", |c| c.name()))
-                    .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut st.codec, None, "Automatic");
-                        ui.selectable_value(&mut st.codec, Some(Codec::Hevc), "hevc");
-                        ui.selectable_value(&mut st.codec, Some(Codec::H264), "h264");
-                        ui.selectable_value(&mut st.codec, Some(Codec::Av1), "av1");
-                    });
-                ui.end_row();
-                ui.label("Bitrate");
-                ui.horizontal(|ui| {
-                    ui.add(
-                        egui::Slider::new(&mut st.bitrate_mbps, 0.0..=200.0)
-                            .step_by(5.0)
-                            .suffix(" Mbit/s"),
-                    );
-                    if st.bitrate_mbps == 0.0 {
-                        ui.label(RichText::new("automatic").weak());
-                    }
-                });
-                ui.end_row();
-            });
-        });
+        stream_options(ui, &mut st.prefs.stream, busy, v.screens);
     });
 }
 
-fn display_row(ui: &mut Ui, d: &FoundDisplay, v: &View, busy: bool, actions: &mut Vec<Action>) {
+fn stream_options(
+    ui: &mut Ui,
+    st: &mut super::prefs::StreamPrefs,
+    connected: bool,
+    screens: &[silkscreen_platform::MonitorInfo],
+) {
+    egui::CollapsingHeader::new("Stream options").show(ui, |ui| {
+        if connected {
+            ui.label(
+                RichText::new(
+                    "Changes apply while connected. Source, resolution, custom size and \
+                     refresh rate reconnect for a second or two.",
+                )
+                .weak(),
+            );
+        }
+        egui::Grid::new("opts").num_columns(2).show(ui, |ui| {
+            ui.label("Source");
+            egui::ComboBox::from_id_salt("source")
+                .selected_text(match st.source {
+                    SourceChoice::Virtual => "New virtual monitor",
+                    SourceChoice::Monitor => "Existing monitor (dummy plug)",
+                    SourceChoice::TestPattern => "Test pattern",
+                })
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(
+                        &mut st.source,
+                        SourceChoice::Virtual,
+                        "New virtual monitor",
+                    );
+                    ui.selectable_value(
+                        &mut st.source,
+                        SourceChoice::Monitor,
+                        "Existing monitor (dummy plug)",
+                    );
+                    ui.selectable_value(&mut st.source, SourceChoice::TestPattern, "Test pattern");
+                });
+            ui.end_row();
+            if st.source == SourceChoice::Monitor {
+                ui.label("Monitor");
+                ui.add(
+                    egui::TextEdit::singleline(&mut st.monitor_name)
+                        .hint_text("auto (the only secondary)"),
+                );
+                ui.end_row();
+            }
+            ui.label("Screen to mirror");
+            if screens.is_empty() {
+                ui.label(RichText::new("chosen in the screen-sharing dialog").weak());
+            } else {
+                let label = |id: &Option<String>| match id {
+                    None => "Main screen".to_owned(),
+                    Some(id) => screens.iter().find(|m| &m.id == id).map_or_else(
+                        || format!("{id} (not connected)"),
+                        |m| m.description.clone(),
+                    ),
+                };
+                egui::ComboBox::from_id_salt("mirror-screen")
+                    .selected_text(label(&st.mirror_screen))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut st.mirror_screen, None, label(&None));
+                        for m in screens {
+                            let text = if m.main {
+                                format!("{} (main)", m.description)
+                            } else {
+                                m.description.clone()
+                            };
+                            ui.selectable_value(&mut st.mirror_screen, Some(m.id.clone()), text);
+                        }
+                    })
+                    .response
+                    .on_hover_text("What Mirror shows on a display");
+            }
+            ui.end_row();
+            ui.label("Resolution");
+            ui.add_enabled_ui(st.size.is_none(), |ui| {
+                use crate::host::Resolution as R;
+                let label = |r: R| match r {
+                    R::Auto => "Automatic (half above 4K)",
+                    R::Full => "Full (sharpest, more latency)",
+                    R::Half => "Half (lowest latency)",
+                };
+                egui::ComboBox::from_id_salt("resolution")
+                    .selected_text(label(st.resolution))
+                    .show_ui(ui, |ui| {
+                        for r in [R::Auto, R::Full, R::Half] {
+                            ui.selectable_value(&mut st.resolution, r, label(r));
+                        }
+                    });
+            });
+            ui.end_row();
+            ui.label("Custom size");
+            ui.horizontal(|ui| {
+                let mut custom = st.size.is_some();
+                if ui
+                    .checkbox(&mut custom, "")
+                    .on_hover_text("Use this size instead of the display's own")
+                    .changed()
+                {
+                    st.size = custom.then_some((1920, 1080));
+                }
+                if let Some((w, h)) = &mut st.size {
+                    ui.add(egui::DragValue::new(w).range(320..=8192));
+                    ui.label("×");
+                    ui.add(egui::DragValue::new(h).range(240..=8192));
+                }
+            });
+            ui.end_row();
+            ui.label("Refresh rate");
+            ui.horizontal(|ui| {
+                let mut custom = st.refresh_hz.is_some();
+                if ui
+                    .checkbox(&mut custom, "")
+                    .on_hover_text("Use this rate instead of the display's own")
+                    .changed()
+                {
+                    st.refresh_hz = custom.then_some(60.0);
+                }
+                match &mut st.refresh_hz {
+                    Some(hz) => {
+                        ui.add(egui::DragValue::new(hz).range(10.0..=240.0).suffix(" Hz"));
+                    }
+                    None => {
+                        ui.label(RichText::new("the display's").weak());
+                    }
+                }
+            });
+            ui.end_row();
+            ui.label("Frame rate limit");
+            let fps_label = |f: Option<u32>| match f {
+                None => "Off (every frame)".to_owned(),
+                Some(f) => format!("{f} frames a second"),
+            };
+            egui::ComboBox::from_id_salt("max-fps")
+                .selected_text(fps_label(st.max_fps))
+                .show_ui(ui, |ui| {
+                    for f in [None, Some(60), Some(45), Some(30), Some(20), Some(15)] {
+                        ui.selectable_value(&mut st.max_fps, f, fps_label(f));
+                    }
+                })
+                .response
+                .on_hover_text(
+                    "Sends fewer frames (and less data) without changing the screen's own \
+                     refresh rate. On Wi-Fi, 30 often keeps the picture from falling behind.",
+                );
+            ui.end_row();
+            ui.label("Codec");
+            let codec_label = |c: Option<Codec>| match c {
+                None => "Automatic",
+                Some(Codec::PyroWave) => "pyrowave (experimental)",
+                Some(c) => c.name(),
+            };
+            egui::ComboBox::from_id_salt("codec")
+                .selected_text(codec_label(st.codec))
+                .show_ui(ui, |ui| {
+                    for c in [None, Some(Codec::Hevc), Some(Codec::H264), Some(Codec::Av1)] {
+                        ui.selectable_value(&mut st.codec, c, codec_label(c));
+                    }
+                    let pyrowave = !silkscreen_codec::compiled_encoders(Codec::PyroWave).is_empty();
+                    ui.add_enabled_ui(pyrowave, |ui| {
+                        ui.selectable_value(
+                            &mut st.codec,
+                            Some(Codec::PyroWave),
+                            codec_label(Some(Codec::PyroWave)),
+                        )
+                        .on_hover_text(
+                            "A GPU wavelet codec: well under a millisecond to encode and decode, \
+                             but it needs several hundred Mbit/s, so use it on Ethernet. Both \
+                             computers need a GPU that supports it.",
+                        )
+                        .on_disabled_hover_text(
+                            "This computer's GPU can't run PyroWave (it needs Vulkan with a recent \
+                             GPU, or an Apple Silicon Mac).",
+                        );
+                    });
+                });
+            ui.end_row();
+            ui.label("Encoder");
+            let encoders = st
+                .codec
+                .map(silkscreen_codec::compiled_encoders)
+                .unwrap_or_default();
+            if st
+                .encoder
+                .as_ref()
+                .is_some_and(|e| !encoders.contains(&e.as_str()))
+            {
+                st.encoder = None; // belongs to another codec
+            }
+            ui.add_enabled_ui(st.codec.is_some(), |ui| {
+                egui::ComboBox::from_id_salt("encoder")
+                    .selected_text(st.encoder.as_deref().unwrap_or("Automatic"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut st.encoder, None, "Automatic");
+                        for e in encoders {
+                            ui.selectable_value(&mut st.encoder, Some(e.to_owned()), e);
+                        }
+                    })
+                    .response
+                    .on_disabled_hover_text("Choose a codec first")
+                    .on_hover_text("Automatic tries hardware encoders first, then software");
+            });
+            ui.end_row();
+            ui.label("Bitrate");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::Slider::new(&mut st.bitrate_mbps, 0.0..=1000.0)
+                        .logarithmic(true)
+                        .smallest_positive(5.0)
+                        .integer()
+                        .suffix(" Mbit/s"),
+                );
+                if st.bitrate_mbps == 0.0 {
+                    ui.label(
+                        RichText::new(if st.codec == Some(Codec::PyroWave) {
+                            "automatic (about 1 bit per pixel)"
+                        } else {
+                            "automatic"
+                        })
+                        .weak(),
+                    );
+                }
+            });
+            ui.end_row();
+            ui.label("Packet size");
+            ui.add(
+                egui::DragValue::new(&mut st.datagram_len)
+                    .range(MIN_DATAGRAM_LEN..=9000)
+                    .suffix(" bytes"),
+            )
+            .on_hover_text(format!(
+                "UDP datagram size (default {}). Raise to about 8900 on a jumbo-frame network.",
+                silkscreen_proto::DEFAULT_DATAGRAM_LEN
+            ));
+            ui.end_row();
+        });
+        ui.checkbox(
+            &mut st.reconnect,
+            "Reconnect automatically if the display goes away",
+        );
+    });
+}
+
+fn display_row(
+    ui: &mut Ui,
+    d: &FoundDisplay,
+    v: &View,
+    connected: bool,
+    actions: &mut Vec<Action>,
+) {
     let own = d.key == Some(v.ctx.identity.public);
     let paired = d.key.is_some_and(|k| v.ctx.paired.knows(&k));
     let compatible = d.protocol == PROTOCOL_VERSION;
@@ -422,10 +774,23 @@ fn display_row(ui: &mut Ui, d: &FoundDisplay, v: &View, busy: bool, actions: &mu
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if !compatible {
                         ui.label(RichText::new("needs update").color(WARN));
+                    } else if connected {
+                        ui.label(RichText::new("connected").color(GOOD));
                     } else if !own {
-                        let label = if paired { "Connect" } else { "Pair…" };
-                        if ui.add_enabled(!busy, egui::Button::new(label)).clicked() {
-                            actions.push(Action::Connect(d.addr.to_string()));
+                        // Right to left: Mirror ends up after Extend.
+                        let pair = (!paired)
+                            .then_some("You'll pair first: type the code this display shows");
+                        let mirror = ui.button("Mirror").on_hover_text(
+                            pair.unwrap_or("Show a copy of one of this computer's screens"),
+                        );
+                        if mirror.clicked() {
+                            actions.push(Action::Connect(d.addr.to_string(), true));
+                        }
+                        let extend = ui
+                            .button("Extend")
+                            .on_hover_text(pair.unwrap_or("Give it its own virtual monitor"));
+                        if extend.clicked() {
+                            actions.push(Action::Connect(d.addr.to_string(), false));
                         }
                     }
                 });
@@ -433,7 +798,26 @@ fn display_row(ui: &mut Ui, d: &FoundDisplay, v: &View, busy: bool, actions: &mu
         });
 }
 
-fn host_status(ui: &mut Ui, st: &mut UiState, h: &HostState, actions: &mut Vec<Action>) {
+fn host_status(
+    ui: &mut Ui,
+    st: &mut UiState,
+    i: usize,
+    mirror: bool,
+    h: &HostState,
+    actions: &mut Vec<Action>,
+) {
+    // Several sessions show the same widgets; keep their ids apart.
+    ui.push_id(i, |ui| host_status_inner(ui, st, i, mirror, h, actions));
+}
+
+fn host_status_inner(
+    ui: &mut Ui,
+    st: &mut UiState,
+    i: usize,
+    mirror: bool,
+    h: &HostState,
+    actions: &mut Vec<Action>,
+) {
     let target = h.display.clone().unwrap_or_else(|| "display".into());
     match &h.phase {
         HostPhase::Idle | HostPhase::Connecting(_) => {
@@ -441,7 +825,7 @@ fn host_status(ui: &mut Ui, st: &mut UiState, h: &HostState, actions: &mut Vec<A
                 ui.spinner();
                 ui.label(format!("Connecting to {target}…"));
                 if ui.button("Cancel").clicked() {
-                    actions.push(Action::StopHost);
+                    actions.push(Action::StopHost(i));
                 }
             });
         }
@@ -467,23 +851,27 @@ fn host_status(ui: &mut Ui, st: &mut UiState, h: &HostState, actions: &mut Vec<A
                 let ready = st.code_input.len() == 6;
                 let enter = r.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
                 if ui.add_enabled(ready, egui::Button::new("Pair")).clicked() || (ready && enter) {
-                    actions.push(Action::SubmitCode(std::mem::take(&mut st.code_input)));
+                    actions.push(Action::SubmitCode(i, std::mem::take(&mut st.code_input)));
                 }
                 if ui.button("Cancel").clicked() {
-                    actions.push(Action::StopHost);
+                    actions.push(Action::StopHost(i));
                 }
             });
         }
         HostPhase::Streaming => {
             ui.horizontal(|ui| {
                 ui.label(
-                    RichText::new(format!("Extending to {target}"))
-                        .color(GOOD)
-                        .strong(),
+                    RichText::new(if mirror {
+                        format!("Mirroring to {target}")
+                    } else {
+                        format!("Extending to {target}")
+                    })
+                    .color(GOOD)
+                    .strong(),
                 );
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if ui.button("Disconnect").clicked() {
-                        actions.push(Action::StopHost);
+                        actions.push(Action::StopHost(i));
                     }
                 });
             });
@@ -494,7 +882,7 @@ fn host_status(ui: &mut Ui, st: &mut UiState, h: &HostState, actions: &mut Vec<A
                 ui.spinner();
                 ui.label(format!("Reconnecting to {target}…"));
                 if ui.button("Stop").clicked() {
-                    actions.push(Action::StopHost);
+                    actions.push(Action::StopHost(i));
                 }
             });
             ui.label(RichText::new(reason).weak());
@@ -506,7 +894,7 @@ fn host_status(ui: &mut Ui, st: &mut UiState, h: &HostState, actions: &mut Vec<A
                     None => ui.label("Disconnected."),
                 };
                 if ui.button("OK").clicked() {
-                    actions.push(Action::DismissHost);
+                    actions.push(Action::DismissHost(i));
                 }
             });
         }
@@ -610,10 +998,13 @@ fn debug_tab(ui: &mut Ui, st: &mut UiState, v: &View) {
             });
     });
     ui.add_space(8.0);
-    if let Some(h) = &v.host {
-        card(ui, "Host session", |ui| {
-            ui.label(format!("{:?}", h.phase));
-            host_stats(ui, h);
+    for (i, (target, _, h)) in v.hosts.iter().enumerate() {
+        let title = format!("Host session: {}", h.display.as_deref().unwrap_or(target));
+        ui.push_id(i, |ui| {
+            card(ui, &title, |ui| {
+                ui.label(format!("{:?}", h.phase));
+                host_stats(ui, h);
+            });
         });
         ui.add_space(8.0);
     }
@@ -632,7 +1023,7 @@ fn debug_tab(ui: &mut Ui, st: &mut UiState, v: &View) {
 
 fn diagnostics() -> Vec<(String, String)> {
     let mut out = vec![("FFmpeg".to_string(), silkscreen_codec::ffmpeg_version())];
-    for codec in [Codec::Hevc, Codec::H264, Codec::Av1] {
+    for codec in [Codec::Hevc, Codec::H264, Codec::Av1, Codec::PyroWave] {
         out.push((
             format!("{} encoders", codec.name()),
             silkscreen_codec::compiled_encoders(codec).join(", "),
@@ -679,6 +1070,10 @@ fn display_stats(ui: &mut Ui, d: &DisplayState) {
                 "Dropped / lost",
                 format!("{} frames · {} packets", d.frames_dropped, d.packets_lost),
             );
+            row(ui, "Behind host", format!("{:.0} ms (queued)", d.behind_ms));
+            if d.catch_ups > 0 {
+                row(ui, "Skipped ahead", format!("{} times", d.catch_ups));
+            }
         });
 }
 
@@ -725,7 +1120,9 @@ fn log_view(ui: &mut Ui, st: &mut UiState, height: f32) {
                 ] {
                     ui.selectable_value(&mut st.log_level, l, l.as_str());
                 }
-            });
+            })
+            .response
+            .on_hover_text("DEBUG and TRACE also record more detail, like -v and -vv");
         ui.add(
             egui::TextEdit::singleline(&mut st.log_filter)
                 .hint_text("filter")
@@ -764,19 +1161,53 @@ fn log_view(ui: &mut Ui, st: &mut UiState, height: f32) {
 pub fn display_waiting(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Vec<Action>) {
     let d = v.display.clone().unwrap_or_default();
     egui::CentralPanel::default()
-        .frame(egui::Frame::new().fill(Color32::from_rgb(14, 16, 22)).inner_margin(24.0))
+        .frame(
+            egui::Frame::new()
+                .fill(Color32::from_rgb(14, 16, 22))
+                .inner_margin(24.0),
+        )
         .show(ui, |ui| {
             ui.vertical_centered(|ui| {
-                ui.add_space((ui.available_height() * 0.18).max(10.0));
-                ui.label(RichText::new(v.ctx.name()).size(44.0).strong());
-                ui.add_space(12.0);
+                ui.add_space((ui.available_height() * 0.16).max(10.0));
+                // The app's name, then (smaller) this display's name.
+                ui.label(
+                    RichText::new("Silkscreen")
+                        .size(54.0)
+                        .strong()
+                        .color(ACCENT),
+                );
+                ui.add_space(16.0);
+                ui.label(
+                    RichText::new(v.ctx.name())
+                        .size(32.0)
+                        .strong()
+                        .color(Color32::WHITE),
+                );
+                ui.add_space(18.0);
                 match &d.phase {
                     DisplayPhase::Pairing { host, code } => {
-                        ui.label(RichText::new(format!("\"{host}\" wants to use this display")).size(22.0));
-                        ui.label(RichText::new("Enter this code on that computer:").size(18.0).weak());
+                        ui.label(
+                            RichText::new(format!("\"{host}\" wants to use this display"))
+                                .size(22.0),
+                        );
+                        ui.label(
+                            RichText::new("Enter this code on that computer:")
+                                .size(18.0)
+                                .weak(),
+                        );
                         ui.add_space(8.0);
-                        let spaced = format!("{} {}", &code[..3.min(code.len())], &code[3.min(code.len())..]);
-                        ui.label(RichText::new(spaced).size(96.0).monospace().strong().color(ACCENT));
+                        let spaced = format!(
+                            "{} {}",
+                            &code[..3.min(code.len())],
+                            &code[3.min(code.len())..]
+                        );
+                        ui.label(
+                            RichText::new(spaced)
+                                .size(96.0)
+                                .monospace()
+                                .strong()
+                                .color(ACCENT),
+                        );
                     }
                     _ => {
                         centered_row(ui, "status", |ui| {
@@ -784,34 +1215,61 @@ pub fn display_waiting(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Ve
                             ui.label(RichText::new("Ready — waiting for a host").size(22.0));
                         });
                         ui.label(
-                            RichText::new("On the other computer, open Silkscreen and pick this display.")
-                                .size(16.0)
-                                .weak(),
+                            RichText::new(
+                                "On the other computer, open Silkscreen and pick this display.",
+                            )
+                            .size(16.0)
+                            .weak(),
                         );
                     }
                 }
                 ui.add_space(24.0);
-                let ips = v.local_ips.iter().map(|i| i.to_string()).collect::<Vec<_>>().join("  ·  ");
-                ui.label(RichText::new(format!("{ips}    {}", v.ctx.identity.fingerprint())).monospace().weak());
+                let ips = v
+                    .local_ips
+                    .iter()
+                    .map(|i| i.to_string())
+                    .collect::<Vec<_>>()
+                    .join("  ·  ");
+                ui.label(
+                    RichText::new(format!("{ips}    {}", v.ctx.identity.fingerprint()))
+                        .monospace()
+                        .weak(),
+                );
                 ui.add_space(24.0);
                 centered_row(ui, "buttons", |ui| {
                     if ui.button("Stop display mode").clicked() {
                         actions.push(Action::StopDisplay);
                     }
-                    if ui.button(if v.overlay { "Hide debug" } else { "Show debug" }).clicked() {
+                    if ui
+                        .button(if v.overlay {
+                            "Hide debug"
+                        } else {
+                            "Show debug"
+                        })
+                        .clicked()
+                    {
                         actions.push(Action::ToggleOverlay);
                     }
                 });
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(format!(
-                        "{} disconnects / leaves display mode  ·  {} debug overlay  ·  {} fullscreen",
-                        hotkey_label('G'),
-                        hotkey_label('D'),
-                        hotkey_label('F')
-                    ))
-                    .weak(),
-                );
+                ui.add_space(20.0);
+                // Keyboard shortcuts: one per line, keys on the left.
+                centered_row(ui, "shortcuts", |ui| {
+                    egui::Grid::new("shortcuts")
+                        .num_columns(2)
+                        .spacing(egui::vec2(18.0, 6.0))
+                        .show(ui, |ui| {
+                            for (key, what) in [
+                                ('G', "Disconnect (or leave display mode)"),
+                                ('D', "Show or hide debug info"),
+                                ('F', "Fullscreen on or off"),
+                                ('H', "Hardware decoding on or off"),
+                            ] {
+                                ui.label(RichText::new(hotkey_label(key)).monospace().weak());
+                                ui.label(RichText::new(what).weak());
+                                ui.end_row();
+                            }
+                        });
+                });
                 if v.overlay {
                     ui.add_space(16.0);
                     // A centred block, left-aligned inside (it holds a log).
@@ -896,6 +1354,13 @@ pub fn stream_overlay(ctx: &egui::Context, st: &mut UiState, v: &View, show_hint
                         ui.set_max_width(760.0);
                         ui.label(RichText::new("Silkscreen debug").strong().color(ACCENT));
                         display_stats(ui, &v.display.clone().unwrap_or_default());
+                        ui.label(
+                            RichText::new(format!(
+                                "{} switches hardware decoding on or off",
+                                hotkey_label('H')
+                            ))
+                            .weak(),
+                        );
                         log_view(ui, st, 180.0);
                     });
             });

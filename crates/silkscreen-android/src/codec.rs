@@ -24,6 +24,8 @@ fn mime(codec: Codec) -> &'static str {
         Codec::H264 => "video/avc",
         Codec::Hevc => "video/hevc",
         Codec::Av1 => "video/av01",
+        // Not advertised by this app; MediaCodec refuses it if asked.
+        Codec::PyroWave => "video/x-pyrowave",
     }
 }
 
