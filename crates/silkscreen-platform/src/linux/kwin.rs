@@ -509,7 +509,9 @@ fn set_scale(output: &str, scale: f64) {
 /// applications directory, for the desktop entry's `Icon=silkscreen`.
 fn install_icon(applications: &std::path::Path) {
     const SVG: &[u8] = include_bytes!("../../../../assets/icon.svg");
-    let Some(data) = applications.parent() else { return };
+    let Some(data) = applications.parent() else {
+        return;
+    };
     let dir = data.join("icons/hicolor/scalable/apps");
     let path = dir.join("silkscreen.svg");
     if std::fs::read(&path).is_ok_and(|c| c == SVG) {
