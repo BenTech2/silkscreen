@@ -408,11 +408,30 @@ impl Encoder {
     }
 }
 
+/// Input pixel formats an encoder accepts (empty: unknown / any).
+#[cfg(ffmpeg_7_1)]
 unsafe fn supported_pix_fmts(codec: *const ff::AVCodec) -> Vec<Pix> {
-    // `pix_fmts` is deprecated in favour of avcodec_get_supported_config()
-    // (FFmpeg 7.1+) but still present, and works on older FFmpeg too
-    // (Ubuntu 24.04 ships 6.1, Raspberry Pi OS Bookworm 5.1).
-    #[allow(deprecated)]
+    let mut out: *const std::ffi::c_void = std::ptr::null();
+    let mut n = 0;
+    let ret = unsafe {
+        ff::avcodec_get_supported_config(
+            std::ptr::null(),
+            codec,
+            ff::AVCodecConfig::AV_CODEC_CONFIG_PIX_FORMAT,
+            0,
+            &mut out,
+            &mut n,
+        )
+    };
+    if ret < 0 || out.is_null() {
+        return Vec::new();
+    }
+    unsafe { std::slice::from_raw_parts(out as *const Pix, n as usize) }.to_vec()
+}
+
+/// Before FFmpeg 7.1 (Ubuntu 24.04 ships 6.1) the list is a field.
+#[cfg(not(ffmpeg_7_1))]
+unsafe fn supported_pix_fmts(codec: *const ff::AVCodec) -> Vec<Pix> {
     let mut p = unsafe { (*codec).pix_fmts };
     let mut out = Vec::new();
     if p.is_null() {
