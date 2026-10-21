@@ -382,11 +382,11 @@ impl Encoder {
                 ff::avcodec_send_frame(self.ctx.0, send),
                 "avcodec_send_frame",
             )?;
-            // Most hardware encoders return the packet right away; some
-            // (VideoToolbox) finish asynchronously a moment later. Wait for
-            // it rather than letting every frame go out one frame late.
+            // Most hardware encoders return the packet right away. Some
+            // (VideoToolbox) finish asynchronously: give them a moment, and
+            // let `poll` pick up anything later rather than stall capture.
             // The very first frame can take much longer (session start-up).
-            let wait = if self.frames_out == 0 { 1000 } else { 40 };
+            let wait = if self.frames_out == 0 { 1000 } else { 4 };
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(wait);
             loop {
                 let n = self.drain(emit)?;
@@ -397,6 +397,13 @@ impl Encoder {
                 std::thread::sleep(std::time::Duration::from_micros(200));
             }
         }
+    }
+
+    /// Emits packets an asynchronous encoder finished since the last call.
+    pub fn poll(&mut self, mut emit: impl FnMut(&[u8], bool)) -> Result<()> {
+        let n = unsafe { self.drain(&mut emit)? };
+        self.frames_out += n as u64;
+        Ok(())
     }
 
     /// Emits every packet that is ready; returns how many there were.

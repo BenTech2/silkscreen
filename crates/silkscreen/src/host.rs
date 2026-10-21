@@ -481,6 +481,9 @@ fn run_session(
             if let Some(e) = err {
                 return Err(e);
             }
+            if let Some(s) = stream.as_mut() {
+                s.poll(started.elapsed().as_micros() as u64, &udp, &mut stats)?;
+            }
             if want_key {
                 last_keyframe_sent = Instant::now();
                 if !got && let Some(s) = stream.as_mut() {
@@ -692,6 +695,19 @@ impl ActiveStream {
             stats.frame(data.len(), is_key);
         })?;
         stats.encode_time(t.elapsed());
+        send_err.map_or(Ok(()), Err)
+    }
+
+    /// Sends packets an asynchronous encoder finished after `encode` returned.
+    fn poll(&mut self, pts: u64, udp: &std::net::UdpSocket, stats: &mut Throughput) -> Result<()> {
+        let packetizer = &mut self.packetizer;
+        let mut send_err = None;
+        self.encoder.poll(|data, is_key| {
+            if let Err(e) = send_frame(packetizer, udp, data, is_key, pts) {
+                send_err = Some(e);
+            }
+            stats.frame(data.len(), is_key);
+        })?;
         send_err.map_or(Ok(()), Err)
     }
 
