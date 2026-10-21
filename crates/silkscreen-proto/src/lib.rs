@@ -17,7 +17,7 @@ pub use control::*;
 pub use video::*;
 
 /// Bumped whenever the wire format changes incompatibly.
-pub const PROTOCOL_VERSION: u16 = 2;
+pub const PROTOCOL_VERSION: u16 = 3;
 
 /// Default TCP port a display listens on for control connections.
 pub const DEFAULT_CONTROL_PORT: u16 = 47_810;

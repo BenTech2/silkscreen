@@ -9,18 +9,22 @@ mod app;
 mod display;
 mod host;
 mod keymap;
+mod mirror;
+mod pacer;
 
 use silkscreen_core::{ctx, discovery, logbuf, net, secure, status};
 
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand, ValueEnum};
 use silkscreen_platform::SourceKind;
 use silkscreen_proto::{Codec, DEFAULT_CONTROL_PORT, DEFAULT_DATAGRAM_LEN, PROTOCOL_VERSION};
+use tracing::Level;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::{EnvFilter, Layer, reload};
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -32,9 +36,17 @@ struct Cli {
     #[arg(long, global = true)]
     name: Option<String>,
     /// Open the app and extend this computer to the given display (name or
-    /// address) right away — handy for a desktop shortcut.
+    /// address) right away — handy for a desktop shortcut. Repeat it to
+    /// extend to several displays.
     #[arg(long)]
-    connect: Option<String>,
+    connect: Vec<String>,
+    /// Like --connect, but the display shows a copy of this computer's main
+    /// screen (or the one picked in Stream options). Repeatable.
+    #[arg(long)]
+    mirror: Vec<String>,
+    /// Started at login: open as the app's login setting says.
+    #[arg(long, hide = true)]
+    autostart: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -44,8 +56,9 @@ enum Command {
     /// Open the app straight in display mode: this computer becomes a
     /// wireless display that hosts can extend onto.
     Display {
-        #[arg(long, default_value_t = DEFAULT_CONTROL_PORT)]
-        port: u16,
+        /// Port to listen on (default: the app's setting, normally 47810).
+        #[arg(long)]
+        port: Option<u16>,
         /// Run in a window instead of fullscreen.
         #[arg(long)]
         windowed: bool,
@@ -64,6 +77,10 @@ enum Command {
         /// Don't forward this computer's keyboard to the host.
         #[arg(long)]
         no_keyboard: bool,
+        /// Skip queued frames to catch up when the picture is more than this
+        /// many milliseconds behind the host (e.g. 150 on Wi-Fi).
+        #[arg(long, value_name = "MS")]
+        skip_behind: Option<u32>,
         /// Keep this screen from sleeping while it shows a host (saved).
         #[arg(long, value_enum)]
         keep_awake: Option<KeepAwakeArg>,
@@ -117,6 +134,10 @@ enum Command {
         /// UDP datagram size; raise to ~8900 on a jumbo-frame network.
         #[arg(long, default_value_t = DEFAULT_DATAGRAM_LEN)]
         mtu: usize,
+        /// Send at most this many frames a second (e.g. 30 on Wi-Fi); the
+        /// screen keeps its refresh rate.
+        #[arg(long, value_name = "FPS")]
+        max_fps: Option<f32>,
         /// Exit when the display disconnects instead of reconnecting.
         #[arg(long)]
         once: bool,
@@ -137,6 +158,10 @@ enum Command {
     },
     /// Show codecs, hardware acceleration and capture backends available here.
     Doctor,
+    /// Try PyroWave on this GPU (run by the app in a separate process, so a
+    /// driver crash can't take the app down). Exit code 0 if it works.
+    #[command(hide = true)]
+    PyrowaveProbe,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -161,6 +186,8 @@ enum CodecArg {
     H264,
     Hevc,
     Av1,
+    /// Experimental GPU wavelet codec; needs a few hundred Mbit/s.
+    Pyrowave,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -173,11 +200,92 @@ enum SourceArg {
     TestPattern,
 }
 
+static SET_LOG_LEVEL: OnceLock<Box<dyn Fn(Level) + Send + Sync>> = OnceLock::new();
+
+/// Changes how much is logged at runtime: the GUI's `-v` / `-vv`.
+pub fn set_log_level(level: Level) {
+    if let Some(set) = SET_LOG_LEVEL.get() {
+        set(level);
+    }
+}
+
+fn log_filter(level: Level) -> EnvFilter {
+    let l = level.as_str().to_lowercase();
+    EnvFilter::new(format!(
+        "warn,silkscreen={l},silkscreen_codec={l},silkscreen_platform={l}"
+    ))
+}
+
 fn parse_size(s: &str) -> Result<(u32, u32)> {
     let Some((w, h)) = s.split_once(['x', 'X']) else {
         bail!("expected WIDTHxHEIGHT, got {s:?}")
     };
     Ok((w.trim().parse()?, h.trim().parse()?))
+}
+
+/// Opens this run's log file, keeping the previous run's as `.old.log`.
+fn open_log(path: &std::path::Path) -> Option<std::fs::File> {
+    let _ = std::fs::create_dir_all(path.parent()?);
+    let _ = std::fs::rename(path, path.with_extension("old.log"));
+    std::fs::File::create(path).ok()
+}
+
+/// Runs `silkscreen pyrowave-probe` and reports whether PyroWave worked
+/// there (a crash or a hang counts as no).
+#[cfg(feature = "pyrowave")]
+fn probe_pyrowave_in_child() -> bool {
+    use std::io::Read;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let mut child = match Command::new(exe)
+        .arg("pyrowave-probe")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!("cannot run the PyroWave check: {e}");
+            return false;
+        }
+    };
+    let mut stderr = child.stderr.take();
+    let output = std::thread::spawn(move || {
+        let mut s = String::new();
+        if let Some(e) = stderr.as_mut() {
+            let _ = e.read_to_string(&mut s);
+        }
+        s
+    });
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            _ => {
+                let _ = child.kill();
+                break None;
+            }
+        }
+    };
+    let ok = status.is_some_and(|s| s.success());
+    if !ok {
+        let out = output.join().unwrap_or_default();
+        let tail: Vec<_> = out.lines().rev().take(15).collect();
+        tracing::warn!(
+            "PyroWave check {} on this GPU:\n{}",
+            match status {
+                Some(s) => format!("failed ({s})"),
+                None => "hung".to_owned(),
+            },
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        );
+    }
+    ok
 }
 
 #[cfg(windows)]
@@ -196,56 +304,87 @@ fn main() -> Result<()> {
     }
     let cli = Cli::parse();
     let level = match cli.verbose {
-        0 => "info",
-        1 => "debug",
-        _ => "trace",
+        0 => Level::INFO,
+        1 => Level::DEBUG,
+        _ => Level::TRACE,
     };
-    let filter = || {
-        EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new(format!(
-                "warn,silkscreen={level},silkscreen_codec={level},silkscreen_platform={level}"
-            ))
-        })
-    };
+    let filter = || EnvFilter::try_from_default_env().unwrap_or_else(|_| log_filter(level));
+    let (term_filter, term_reload) = reload::Layer::new(filter());
+    let (buf_filter, buf_reload) = reload::Layer::new(filter());
+    let (file_filter, file_reload) = reload::Layer::new(filter());
+    // The app (not one-shot commands) also logs to a file: on Windows it
+    // has no console, so that is where a crash can be looked into.
+    let gui_run = matches!(
+        cli.command,
+        None | Some(Command::Display { headless: None, .. })
+    );
+    let log_path = secure::config_dir().join("silkscreen.log");
+    let log_file = gui_run.then(|| open_log(&log_path)).flatten();
     tracing_subscriber::registry()
         .with(
             tracing_subscriber::fmt::layer()
                 .with_target(false)
-                .with_filter(filter()),
+                .with_filter(term_filter),
         )
-        .with(logbuf::BufferLayer.with_filter(filter()))
+        .with(logbuf::BufferLayer.with_filter(buf_filter))
+        .with(log_file.map(|f| {
+            tracing_subscriber::fmt::layer()
+                .with_target(false)
+                .with_ansi(false)
+                .with_writer(std::sync::Mutex::new(f))
+                .with_filter(file_filter)
+        }))
         .init();
+    let _ = SET_LOG_LEVEL.set(Box::new(move |l| {
+        let _ = term_reload.reload(log_filter(l));
+        let _ = buf_reload.reload(log_filter(l));
+        let _ = file_reload.reload(log_filter(l));
+    }));
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let bt = std::backtrace::Backtrace::force_capture();
+        tracing::error!("crashed: {info}\n{bt}");
+        default_hook(info);
+        if gui_run {
+            silkscreen_platform::alert(
+                "Silkscreen stopped working",
+                &format!("{info}\n\nDetails are in {}", log_path.display()),
+            );
+        }
+    }));
+    tracing::info!(
+        "silkscreen {} ({} {})",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
+    #[cfg(feature = "pyrowave")]
+    if !matches!(cli.command, Some(Command::PyrowaveProbe)) {
+        silkscreen_codec::pyrowave::set_probe(probe_pyrowave_in_child);
+    }
 
     let ctx = ctx::Ctx::load()?;
     if let Some(name) = &cli.name {
         ctx.override_name(name);
     }
-    let gui = |start_display, display, windowed, monitor, vsync, mouse, keyboard| {
+    let gui = |start_display, prefs, fixed_code| {
         app::run(
             app::GuiOptions {
                 start_display,
-                display,
-                windowed,
-                monitor,
-                vsync,
-                forward_mouse: mouse,
-                forward_keyboard: keyboard,
+                prefs,
+                fixed_code,
                 connect: cli.connect.clone(),
+                mirror: cli.mirror.clone(),
+                log_level: level,
+                autostart: cli.autostart,
             },
             ctx.clone(),
         )
     };
 
     let Some(command) = cli.command else {
-        return gui(
-            false,
-            display::DisplayOptions::default(),
-            false,
-            None,
-            true,
-            true,
-            true,
-        );
+        return gui(false, app::Prefs::load(), None);
     };
     match command {
         Command::Display {
@@ -256,6 +395,7 @@ fn main() -> Result<()> {
             no_vsync,
             no_mouse,
             no_keyboard,
+            skip_behind,
             keep_awake,
             idle_minutes,
             pairing_code,
@@ -290,22 +430,31 @@ fn main() -> Result<()> {
                     }
                 });
             }
-            let opts = display::DisplayOptions {
-                port,
-                hw_decode: !no_hw_decode,
-                fixed_code: pairing_code,
-            };
             match headless {
-                Some(spec) => display::run_headless(opts, ctx.clone(), spec),
-                None => gui(
-                    true,
-                    opts,
-                    windowed,
-                    monitor,
-                    !no_vsync,
-                    !no_mouse,
-                    !no_keyboard,
+                Some(spec) => display::run_headless(
+                    display::DisplayOptions {
+                        port: port.unwrap_or(DEFAULT_CONTROL_PORT),
+                        hw_decode: !no_hw_decode,
+                        fixed_code: pairing_code,
+                        catch_up: skip_behind.map(|ms| Duration::from_millis(ms as u64)),
+                    },
+                    ctx.clone(),
+                    spec,
                 ),
+                None => {
+                    // Flags override the app's saved settings for this run.
+                    let mut prefs = app::Prefs::load();
+                    let d = &mut prefs.display;
+                    d.port = port.unwrap_or(d.port);
+                    d.windowed |= windowed;
+                    d.monitor = monitor.or(d.monitor);
+                    d.hw_decode &= !no_hw_decode;
+                    d.vsync &= !no_vsync;
+                    d.forward_mouse &= !no_mouse;
+                    d.forward_keyboard &= !no_keyboard;
+                    d.skip_behind_ms = skip_behind.or(d.skip_behind_ms);
+                    gui(true, prefs, pairing_code)
+                }
             }
         }
         Command::Host {
@@ -319,6 +468,7 @@ fn main() -> Result<()> {
             refresh,
             mtu,
             once,
+            max_fps,
             code,
             resolution,
         } => host::run(
@@ -328,6 +478,7 @@ fn main() -> Result<()> {
                     CodecArg::H264 => Codec::H264,
                     CodecArg::Hevc => Codec::Hevc,
                     CodecArg::Av1 => Codec::Av1,
+                    CodecArg::Pyrowave => Codec::PyroWave,
                 }),
                 bitrate_kbps: bitrate.map(|m| (m * 1000.0) as u32),
                 encoder,
@@ -340,6 +491,7 @@ fn main() -> Result<()> {
                 refresh_hz: refresh,
                 datagram_len: mtu,
                 persist: !once,
+                max_fps,
                 resolution: match resolution {
                     ResolutionArg::Auto => host::Resolution::Auto,
                     ResolutionArg::Full => host::Resolution::Full,
@@ -413,6 +565,13 @@ fn main() -> Result<()> {
             }
             Ok(())
         }
+        Command::PyrowaveProbe => {
+            #[cfg(feature = "pyrowave")]
+            let ok = silkscreen_codec::pyrowave::probe_here();
+            #[cfg(not(feature = "pyrowave"))]
+            let ok = false;
+            std::process::exit(if ok { 0 } else { 1 });
+        }
         Command::Doctor => {
             println!("silkscreen {}", env!("CARGO_PKG_VERSION"));
             println!(
@@ -421,9 +580,9 @@ fn main() -> Result<()> {
                 ctx.identity.fingerprint()
             );
             println!("FFmpeg {}", silkscreen_codec::ffmpeg_version());
-            for codec in [Codec::H264, Codec::Hevc, Codec::Av1] {
+            for codec in [Codec::H264, Codec::Hevc, Codec::Av1, Codec::PyroWave] {
                 println!(
-                    "  {:<5} encoders: {}",
+                    "  {:<8} encoders: {}",
                     codec.name(),
                     silkscreen_codec::compiled_encoders(codec).join(", ")
                 );

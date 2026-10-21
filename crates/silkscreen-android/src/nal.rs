@@ -9,7 +9,7 @@ pub fn parameter_sets(codec: Codec, au: &[u8]) -> Option<&[u8]> {
     let is_param = |nal: u8| match codec {
         Codec::H264 => matches!(nal & 0x1f, 7 | 8),
         Codec::Hevc => matches!((nal >> 1) & 0x3f, 32..=34),
-        Codec::Av1 => false,
+        Codec::Av1 | Codec::PyroWave => false,
     };
     let mut end = 0;
     let mut i = 0;

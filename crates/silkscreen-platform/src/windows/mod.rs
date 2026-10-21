@@ -111,6 +111,31 @@ fn set_mode(device_name: &str, width: u32, height: u32, hz: u32) {
     }
 }
 
+pub fn alert(title: &str, text: &str) {
+    use ::windows::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
+    use ::windows::core::HSTRING;
+    unsafe {
+        MessageBoxW(
+            None,
+            &HSTRING::from(text),
+            &HSTRING::from(title),
+            MB_OK | MB_ICONERROR,
+        );
+    }
+}
+
+pub fn monitor_list() -> Vec<crate::MonitorInfo> {
+    monitors()
+        .unwrap_or_default()
+        .iter()
+        .map(|m| crate::MonitorInfo {
+            id: m.device_name.clone(),
+            description: describe(m),
+            main: (m.rect.left, m.rect.top) == (0, 0),
+        })
+        .collect()
+}
+
 fn describe(m: &Monitor) -> String {
     let r = m.rect;
     format!(
@@ -173,9 +198,16 @@ pub fn open_screen(req: &ScreenRequest) -> Result<Screen> {
             let all = monitors()?;
             let list = all.iter().map(describe).collect::<Vec<_>>().join(", ");
             let chosen = match wanted {
-                Some(w) => all
-                    .into_iter()
-                    .find(|m| m.device_name.to_lowercase().contains(&w.to_lowercase())),
+                // Exact first: \\.\DISPLAY1 is also part of \\.\DISPLAY10.
+                Some(w) => {
+                    let w = w.to_lowercase();
+                    let exact = all.iter().position(|m| m.device_name.to_lowercase() == w);
+                    let i = exact.or_else(|| {
+                        all.iter()
+                            .position(|m| m.device_name.to_lowercase().contains(&w))
+                    });
+                    i.map(|i| all.into_iter().nth(i).unwrap())
+                }
                 // Without a name, a lone secondary monitor (dummy plug) is the obvious choice.
                 None => {
                     let secondary: Vec<_> = all

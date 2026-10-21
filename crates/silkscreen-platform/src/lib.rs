@@ -12,6 +12,7 @@ use std::time::Duration;
 use anyhow::Result;
 use silkscreen_proto::InputEvent;
 
+pub mod autostart;
 mod keymap;
 pub mod power;
 pub mod testpattern;
@@ -90,6 +91,12 @@ pub fn open_screen(req: &ScreenRequest) -> Result<Screen> {
     if req.kind == SourceKind::TestPattern {
         return Ok(testpattern::open(req));
     }
+    // Several host sessions may plug in virtual monitors at once. The
+    // backends find theirs as "the output that just appeared" (and Windows'
+    // driver reads its mode from one registry slot), so one at a time.
+    static VIRTUAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one_at_a_time = (req.kind == SourceKind::Virtual)
+        .then(|| VIRTUAL.lock().unwrap_or_else(|e| e.into_inner()));
     #[cfg(target_os = "linux")]
     return linux::open_screen(req);
     #[cfg(windows)]
@@ -100,6 +107,35 @@ pub fn open_screen(req: &ScreenRequest) -> Result<Screen> {
     Err(anyhow::anyhow!(
         "screen capture is not supported on this platform"
     ))
+}
+
+/// Tells the user about a fatal error where there may be no terminal to see
+/// it (the Windows app has no console): a message box on Windows.
+pub fn alert(title: &str, text: &str) {
+    #[cfg(windows)]
+    windows::alert(title, text);
+    #[cfg(not(windows))]
+    let _ = (title, text);
+}
+
+/// One of this computer's screens, for picking what to mirror.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MonitorInfo {
+    /// What [`SourceKind::Monitor`] takes to capture this screen.
+    pub id: String,
+    pub description: String,
+    pub main: bool,
+}
+
+/// This computer's screens. Empty where the system asks the user instead
+/// (Linux: the screen-sharing dialog).
+pub fn monitors() -> Vec<MonitorInfo> {
+    #[cfg(windows)]
+    return windows::monitor_list();
+    #[cfg(target_os = "macos")]
+    return macos::monitor_list();
+    #[allow(unreachable_code)]
+    Vec::new()
 }
 
 /// Describes which backends are available here, for `silkscreen doctor`.

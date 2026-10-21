@@ -58,7 +58,8 @@ pub struct Picture<'a> {
     pub planes: Vec<(&'a [u8], usize)>,
 }
 
-pub struct Decoder {
+/// An FFmpeg decoder.
+struct FfDecoder {
     ctx: CodecCtx,
     hw_pix_fmt: Option<Pix>,
     pkt: Packet,
@@ -69,15 +70,16 @@ pub struct Decoder {
     name: String,
 }
 
-unsafe impl Send for Decoder {}
+unsafe impl Send for FfDecoder {}
 
-impl Decoder {
-    pub fn open(codec: Codec, allow_hw: bool) -> Result<Self> {
+impl FfDecoder {
+    fn open(codec: Codec, allow_hw: bool) -> Result<Self> {
         init_logging();
         let id = match codec {
             Codec::H264 => ff::AVCodecID::AV_CODEC_ID_H264,
             Codec::Hevc => ff::AVCodecID::AV_CODEC_ID_HEVC,
             Codec::Av1 => ff::AVCodecID::AV_CODEC_ID_AV1,
+            Codec::PyroWave => bail!("PyroWave is not an FFmpeg codec"),
         };
         unsafe {
             // FFmpeg's default AV1 decoder is libdav1d (software only); the
@@ -114,6 +116,7 @@ impl Decoder {
                         Codec::H264 => c"h264_v4l2m2m",
                         Codec::Hevc => c"hevc_v4l2m2m",
                         Codec::Av1 => c"av1_v4l2m2m",
+                        Codec::PyroWave => unreachable!(),
                     };
                     let m2m = ff::avcodec_find_decoder_by_name(name.as_ptr());
                     if !m2m.is_null() {
@@ -168,7 +171,7 @@ impl Decoder {
                 Some(kind) => format!("{} ({})", cstr((*dec).name), hw_device_name(kind)),
                 None => format!("{} (software)", cstr((*dec).name)),
             };
-            Ok(Decoder {
+            Ok(FfDecoder {
                 ctx,
                 hw_pix_fmt,
                 pkt: Packet::new()?,
@@ -302,15 +305,65 @@ pub fn decodable_codecs() -> Vec<Codec> {
     } else {
         [Codec::Hevc, Codec::H264, Codec::Av1]
     };
-    order
+    let mut codecs: Vec<_> = order
         .into_iter()
         .filter(|c| {
             let id = match c {
                 Codec::H264 => ff::AVCodecID::AV_CODEC_ID_H264,
                 Codec::Hevc => ff::AVCodecID::AV_CODEC_ID_HEVC,
                 Codec::Av1 => ff::AVCodecID::AV_CODEC_ID_AV1,
+                Codec::PyroWave => unreachable!(),
             };
             !unsafe { ff::avcodec_find_decoder(id) }.is_null()
         })
-        .collect()
+        .collect();
+    // Last: experimental, and only used when the host picks it.
+    #[cfg(feature = "pyrowave")]
+    if crate::pyrowave::available() {
+        codecs.push(Codec::PyroWave);
+    }
+    codecs
+}
+
+/// A video decoder: FFmpeg's, or PyroWave.
+pub struct Decoder(Backend);
+
+enum Backend {
+    Ff(FfDecoder),
+    #[cfg(feature = "pyrowave")]
+    PyroWave(crate::pyrowave::PyroDecoder),
+}
+
+impl Decoder {
+    /// Opens a decoder, in hardware when `allow_hw` and possible. PyroWave
+    /// always runs on the GPU.
+    pub fn open(codec: Codec, allow_hw: bool) -> Result<Self> {
+        if codec == Codec::PyroWave {
+            #[cfg(feature = "pyrowave")]
+            return Ok(Decoder(Backend::PyroWave(
+                crate::pyrowave::PyroDecoder::open()?,
+            )));
+            #[cfg(not(feature = "pyrowave"))]
+            bail!("this build of Silkscreen has no PyroWave");
+        }
+        Ok(Decoder(Backend::Ff(FfDecoder::open(codec, allow_hw)?)))
+    }
+
+    pub fn name(&self) -> &str {
+        match &self.0 {
+            Backend::Ff(d) => d.name(),
+            #[cfg(feature = "pyrowave")]
+            Backend::PyroWave(d) => d.name(),
+        }
+    }
+
+    /// Feeds one complete access unit and returns the newest decoded picture,
+    /// if this packet produced one.
+    pub fn decode(&mut self, data: &[u8]) -> Result<Option<Picture<'_>>> {
+        match &mut self.0 {
+            Backend::Ff(d) => d.decode(data),
+            #[cfg(feature = "pyrowave")]
+            Backend::PyroWave(d) => d.decode(data),
+        }
+    }
 }

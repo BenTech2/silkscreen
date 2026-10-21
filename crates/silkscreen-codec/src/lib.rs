@@ -6,6 +6,8 @@ pub mod convert;
 pub mod decoder;
 pub mod encoder;
 mod ff;
+#[cfg(feature = "pyrowave")]
+pub mod pyrowave;
 
 pub use convert::{RgbFrame, RgbLayout};
 pub use decoder::{Decoder, Matrix, Picture, PictureFormat, decodable_codecs};
