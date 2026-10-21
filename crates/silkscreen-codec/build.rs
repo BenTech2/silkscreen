@@ -111,12 +111,24 @@ mod pyrowave {
     /// A directory junction: unlike a symlink, needs no special rights.
     #[cfg(windows)]
     fn link_dir(target: &Path, link: &Path) {
+        // cmd takes a `/` for the start of a switch, so pass plain absolute
+        // paths with backslashes (no `..`, no `\\?\` prefix).
+        fn plain(p: &Path) -> String {
+            let p = p.canonicalize().expect("resolving a path for mklink");
+            let s = p.display().to_string();
+            s.strip_prefix(r"\\?\").unwrap_or(&s).to_owned()
+        }
+        let link = format!(
+            r"{}\{}",
+            plain(link.parent().unwrap()),
+            link.file_name().unwrap().to_string_lossy()
+        );
         let ok = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
-            .arg(link)
-            .arg(target)
+            .arg(&link)
+            .arg(plain(target))
             .status()
             .is_ok_and(|s| s.success());
-        assert!(ok, "linking Granite into PyroWave");
+        assert!(ok, "linking Granite into PyroWave ({link})");
     }
 }
