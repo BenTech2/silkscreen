@@ -106,6 +106,26 @@ impl Decoder {
                         Err(e) => debug!("{} decode unavailable: {e:#}", hw_device_name(kind)),
                     }
                 }
+                // Stateful V4L2 decoders (e.g. the Raspberry Pi 4's H.264
+                // block) are separate decoders rather than hwaccels.
+                #[cfg(target_os = "linux")]
+                {
+                    let name = match codec {
+                        Codec::H264 => c"h264_v4l2m2m",
+                        Codec::Hevc => c"hevc_v4l2m2m",
+                        Codec::Av1 => c"av1_v4l2m2m",
+                    };
+                    let m2m = ff::avcodec_find_decoder_by_name(name.as_ptr());
+                    if !m2m.is_null() {
+                        match Self::open_with(m2m, None) {
+                            Ok(d) => {
+                                info!(decoder = %d.name, "opened {} decoder", codec.name());
+                                return Ok(d);
+                            }
+                            Err(e) => debug!("V4L2 decode unavailable: {e:#}"),
+                        }
+                    }
+                }
             }
             let d = Self::open_with(dec, None)?;
             info!(decoder = %d.name, "opened {} decoder", codec.name());
@@ -269,12 +289,20 @@ unsafe fn cstr(p: *const std::ffi::c_char) -> String {
 }
 
 /// Codecs this machine can decode, in the order a display should prefer
-/// them. HEVC comes first: it is the only widely hardware-accelerated codec
+/// them. HEVC normally comes first (ARM boards are the exception, below): it
+/// is the only widely hardware-accelerated codec
 /// whose encoders and decoders go beyond 4096 pixels (e.g. a 4500x3000
 /// Surface Studio panel), and it needs less bandwidth than H.264.
 pub fn decodable_codecs() -> Vec<Codec> {
     init_logging();
-    [Codec::Hevc, Codec::H264, Codec::Av1]
+    // ARM Linux boards (Raspberry Pi 4/5) have H.264 hardware (Pi 4) or
+    // decode in software (Pi 5), where H.264 costs far less CPU than HEVC.
+    let order = if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+        [Codec::H264, Codec::Hevc, Codec::Av1]
+    } else {
+        [Codec::Hevc, Codec::H264, Codec::Av1]
+    };
+    order
         .into_iter()
         .filter(|c| {
             let id = match c {

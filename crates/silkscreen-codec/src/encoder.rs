@@ -1,7 +1,6 @@
 //! Low-latency encoder selection and encoding.
 
-use std::ffi::{CStr, CString, c_void};
-use std::ptr;
+use std::ffi::{CStr, CString};
 
 use anyhow::{Result, anyhow, bail};
 use ff::{AVHWDeviceType as Hw, AVPixelFormat as Pix};
@@ -380,42 +379,52 @@ impl Encoder {
                 ff::avcodec_send_frame(self.ctx.0, send),
                 "avcodec_send_frame",
             )?;
-            self.drain(emit)
+            // Most hardware encoders return the packet right away; some
+            // (VideoToolbox) finish asynchronously a moment later. Wait for
+            // it rather than letting every frame go out one frame late.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(40);
+            while self.drain(emit)? == 0 && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_micros(200));
+            }
+            Ok(())
         }
     }
 
-    unsafe fn drain(&mut self, emit: &mut impl FnMut(&[u8], bool)) -> Result<()> {
+    /// Emits every packet that is ready; returns how many there were.
+    unsafe fn drain(&mut self, emit: &mut impl FnMut(&[u8], bool)) -> Result<usize> {
+        let mut n = 0;
         loop {
             let ret = unsafe { ff::avcodec_receive_packet(self.ctx.0, self.pkt.0) };
             if ret == EAGAIN || ret == ff::AVERROR_EOF {
-                return Ok(());
+                return Ok(n);
             }
             check(ret, "avcodec_receive_packet")?;
             let p = unsafe { &*self.pkt.0 };
             let data = unsafe { std::slice::from_raw_parts(p.data, p.size as usize) };
             emit(data, p.flags & ff::AV_PKT_FLAG_KEY != 0);
             unsafe { ff::av_packet_unref(self.pkt.0) };
+            n += 1;
         }
     }
 }
 
 unsafe fn supported_pix_fmts(codec: *const ff::AVCodec) -> Vec<Pix> {
-    let mut out: *const c_void = ptr::null();
-    let mut n = 0;
-    let ret = unsafe {
-        ff::avcodec_get_supported_config(
-            ptr::null(),
-            codec,
-            ff::AVCodecConfig::AV_CODEC_CONFIG_PIX_FORMAT,
-            0,
-            &mut out,
-            &mut n,
-        )
-    };
-    if ret < 0 || out.is_null() {
-        return Vec::new();
+    // `pix_fmts` is deprecated in favour of avcodec_get_supported_config()
+    // (FFmpeg 7.1+) but still present, and works on older FFmpeg too
+    // (Ubuntu 24.04 ships 6.1, Raspberry Pi OS Bookworm 5.1).
+    #[allow(deprecated)]
+    let mut p = unsafe { (*codec).pix_fmts };
+    let mut out = Vec::new();
+    if p.is_null() {
+        return out;
     }
-    unsafe { std::slice::from_raw_parts(out as *const Pix, n as usize) }.to_vec()
+    unsafe {
+        while *p != Pix::AV_PIX_FMT_NONE {
+            out.push(*p);
+            p = p.add(1);
+        }
+    }
+    out
 }
 
 /// Names of every encoder in [`candidates`] that this FFmpeg build contains
