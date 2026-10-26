@@ -288,6 +288,7 @@ mod jni_api {
             "code": code,
             "stream": d.stream,
             "decoder": d.decoder,
+            "notice": d.notice,
             "fps": d.fps,
             "latencyMs": d.latency_ms,
             "dropped": d.frames_dropped,

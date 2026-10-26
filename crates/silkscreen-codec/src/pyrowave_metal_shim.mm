@@ -15,10 +15,11 @@ struct Readback
 	id<MTLTexture> planes[3];
 	int width;
 	int height;
+	int full_chroma;
 };
 }
 
-extern "C" void *silkscreen_pyrowave_readback_new(int width, int height)
+extern "C" void *silkscreen_pyrowave_readback_new(int width, int height, int full_chroma)
 {
 	@autoreleasepool
 	{
@@ -31,10 +32,11 @@ extern "C" void *silkscreen_pyrowave_readback_new(int width, int height)
 		r->queue = [device newCommandQueue];
 		r->width = width;
 		r->height = height;
+		r->full_chroma = full_chroma;
 		for (int p = 0; p < 3; p++)
 		{
-			int w = p ? width / 2 : width;
-			int h = p ? height / 2 : height;
+			int w = p && !full_chroma ? width / 2 : width;
+			int h = p && !full_chroma ? height / 2 : height;
 			MTLTextureDescriptor *d =
 			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR8Unorm
 			                                                       width:w
@@ -74,8 +76,8 @@ extern "C" pyrowave_result silkscreen_pyrowave_readback_decode(void *readback, p
 			return PYROWAVE_ERROR_GENERIC;
 		for (int p = 0; p < 3; p++)
 		{
-			int w = p ? r->width / 2 : r->width;
-			int h = p ? r->height / 2 : r->height;
+			int w = p && !r->full_chroma ? r->width / 2 : r->width;
+			int h = p && !r->full_chroma ? r->height / 2 : r->height;
 			[r->planes[p] getBytes:out->data[p]
 			           bytesPerRow:out->row_stride_in_bytes[p]
 			            fromRegion:MTLRegionMake2D(0, 0, w, h)

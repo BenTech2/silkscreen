@@ -39,6 +39,7 @@ mod tests {
             refresh_mhz: 60_000,
             bitrate_kbps: 4_000,
             encoder: forced,
+            chroma444: false,
         };
         let mut enc = match Encoder::open(&cfg) {
             Ok(e) => e,
@@ -124,5 +125,73 @@ mod tests {
         } else {
             assert_eq!(decoded, 10, "decoder must output every frame without delay");
         }
+    }
+
+    /// A 1-pixel red/blue checkerboard: 4:2:0 averages it to purple, 4:4:4
+    /// must keep each pixel's colour.
+    fn checkerboard(w: u32, h: u32) -> Vec<u8> {
+        let mut img = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let p = ((y * w + x) * 4) as usize;
+                if (x + y) % 2 == 0 {
+                    img[p + 2] = 220; // red (BGRX)
+                } else {
+                    img[p] = 220; // blue
+                }
+            }
+        }
+        img
+    }
+
+    /// Mean absolute difference between neighbouring V (red) samples: high
+    /// when per-pixel colour survived, near zero when it was averaged away.
+    fn v_contrast(pic: &Picture) -> f64 {
+        let (v, stride) = pic.planes[2];
+        let (w, h) = (pic.width as usize, pic.height as usize);
+        let mut sum = 0u64;
+        for y in 0..h {
+            for x in 1..w {
+                sum += (v[y * stride + x] as i64 - v[y * stride + x - 1] as i64).unsigned_abs();
+            }
+        }
+        sum as f64 / ((w - 1) * h) as f64
+    }
+
+    #[test]
+    fn chroma444_keeps_colour_detail() {
+        let (w, h) = (128u32, 96u32);
+        let img = checkerboard(w, h);
+        let frame = RgbFrame {
+            width: w,
+            height: h,
+            stride: (w * 4) as usize,
+            layout: RgbLayout::Bgrx,
+            data: &img,
+        };
+        let cfg = EncoderConfig {
+            codec: Codec::H264,
+            width: w,
+            height: h,
+            refresh_mhz: 60_000,
+            bitrate_kbps: 20_000,
+            encoder: Some("libx264".into()),
+            chroma444: true,
+        };
+        let mut enc = match Encoder::open(&cfg) {
+            Ok(e) => e,
+            Err(e) => {
+                eprintln!("skipping (no libx264 here): {e}");
+                return;
+            }
+        };
+        let mut dec = Decoder::open(Codec::H264, false).unwrap();
+        let mut packet = Vec::new();
+        enc.encode(&frame, 0, true, |d, _| packet = d.to_vec())
+            .unwrap();
+        let pic = dec.decode(&packet).unwrap().expect("a picture");
+        assert_eq!(pic.format, PictureFormat::I444);
+        let contrast = v_contrast(&pic);
+        assert!(contrast > 40.0, "colour detail lost: {contrast:.1}");
     }
 }

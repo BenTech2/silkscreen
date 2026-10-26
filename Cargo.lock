@@ -3751,7 +3751,7 @@ dependencies = [
 
 [[package]]
 name = "silkscreen"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -3790,7 +3790,7 @@ dependencies = [
 
 [[package]]
 name = "silkscreen-android"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "jni 0.21.1",
@@ -3806,7 +3806,7 @@ dependencies = [
 
 [[package]]
 name = "silkscreen-codec"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "cc",
@@ -3820,7 +3820,7 @@ dependencies = [
 
 [[package]]
 name = "silkscreen-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -3843,7 +3843,7 @@ dependencies = [
 
 [[package]]
 name = "silkscreen-platform"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "ashpd",
@@ -3875,7 +3875,7 @@ dependencies = [
 
 [[package]]
 name = "silkscreen-proto"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "chacha20poly1305",
  "postcard",

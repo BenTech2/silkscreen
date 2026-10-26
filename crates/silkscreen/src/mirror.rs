@@ -52,6 +52,8 @@ pub struct Settings {
     pub bitrate_kbps: Option<u32>,
     /// Frame rate limit for the shared stream.
     pub max_fps: Option<f32>,
+    /// Full-resolution colour (4:4:4).
+    pub chroma444: bool,
 }
 
 struct Sub {
@@ -237,6 +239,8 @@ fn broadcast(shared: &Shared, ev: &Event) {
 fn common_codecs(st: &State) -> Vec<Codec> {
     let candidates = match st.settings.codec {
         Some(c) => vec![c],
+        // 4:4:4 mostly means software encoding, where x264 is fastest.
+        None if st.settings.chroma444 => vec![Codec::H264, Codec::Hevc, Codec::Av1],
         None => vec![Codec::Hevc, Codec::H264, Codec::Av1],
     };
     candidates
@@ -422,6 +426,7 @@ fn ensure_encoder<'a>(
             refresh_mhz,
             bitrate_kbps,
             encoder: settings.encoder.clone(),
+            chroma444: settings.chroma444,
         };
         match Encoder::open(&cfg) {
             Ok(encoder) => {

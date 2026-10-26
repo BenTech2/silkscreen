@@ -248,6 +248,10 @@ private fun WaitingCard(activity: MainActivity) {
                 Text("Ready — waiting for a computer", fontSize = 20.sp, color = Color.White)
             }
             Text("On the other computer, open Silkscreen and pick this display.", color = Muted, textAlign = TextAlign.Center)
+            s.optString("notice").takeIf { it.isNotBlank() && it != "null" }?.let {
+                Spacer(Modifier.height(12.dp))
+                Text(it, color = Warn, textAlign = TextAlign.Center)
+            }
         }
         Spacer(Modifier.height(20.dp))
         Text(

@@ -62,12 +62,16 @@ pub struct VideoUpload {
     sampler: wgpu::Sampler,
     linearize: bool,
     textures: Mutex<Option<VideoTextures>>,
-    /// Set by `upload`, cleared by the UI when it schedules a redraw.
+    /// A picture is waiting to be drawn: set by `upload`, cleared when the
+    /// window starts drawing.
     pub dirty: AtomicBool,
 }
 
 impl VideoUpload {
-    pub fn upload(&self, pic: &Picture<'_>) {
+    /// Uploads a decoded picture. Returns true if the window must be woken
+    /// to draw it, false if a redraw is already on its way (it will draw
+    /// this newer picture).
+    pub fn upload(&self, pic: &Picture<'_>) -> bool {
         let mut guard = self.textures.lock().unwrap();
         let fits = guard
             .as_ref()
@@ -80,7 +84,7 @@ impl VideoUpload {
             t.color = (pic.matrix, pic.full_range);
             self.write_params(t);
         }
-        let (cw, ch) = (pic.width.div_ceil(2), pic.height.div_ceil(2));
+        let (cw, ch) = chroma_size(pic);
         for (i, &(data, stride)) in pic.planes.iter().enumerate() {
             let (w, h) = if i == 0 {
                 (pic.width, pic.height)
@@ -107,7 +111,12 @@ impl VideoUpload {
                 },
             );
         }
-        self.dirty.store(true, Ordering::Release);
+        // Mark "waiting" and learn whether it already was in one step,
+        // after the upload: deciding before it could miss a redraw that
+        // ran in between, leaving this picture undrawn and every later
+        // one waiting for a wake-up that never came (a frozen picture
+        // until some other event redrew the window).
+        !self.dirty.swap(true, Ordering::AcqRel)
     }
 
     pub fn clear(&self) {
@@ -132,14 +141,14 @@ impl VideoUpload {
                 view_formats: &[],
             })
         };
-        let (cw, ch) = (pic.width.div_ceil(2), pic.height.div_ceil(2));
+        let (cw, ch) = chroma_size(pic);
         let planes = match pic.format {
-            PictureFormat::Nv12 => [
+            PictureFormat::Nv12 | PictureFormat::Nv24 => [
                 tex("y", pic.width, pic.height, wgpu::TextureFormat::R8Unorm),
                 tex("uv", cw, ch, wgpu::TextureFormat::Rg8Unorm),
                 tex("unused", 1, 1, wgpu::TextureFormat::R8Unorm),
             ],
-            PictureFormat::I420 => [
+            PictureFormat::I420 | PictureFormat::I444 => [
                 tex("y", pic.width, pic.height, wgpu::TextureFormat::R8Unorm),
                 tex("u", cw, ch, wgpu::TextureFormat::R8Unorm),
                 tex("v", cw, ch, wgpu::TextureFormat::R8Unorm),
@@ -197,7 +206,9 @@ impl VideoUpload {
     fn write_params(&self, t: &VideoTextures) {
         let p = Params {
             rows: yuv_to_rgb_rows(t.color.0, t.color.1),
-            mode: (t.format == PictureFormat::I420) as u32,
+            // 1: separate U and V planes (their size doesn't matter to the
+            // shader, which samples in normalised coordinates).
+            mode: !matches!(t.format, PictureFormat::Nv12 | PictureFormat::Nv24) as u32,
             linearize: self.linearize as u32,
             _pad: [0; 2],
         };
@@ -284,6 +295,14 @@ fn adapter(
         }
     }
     Err(last.unwrap_or_else(|| anyhow::anyhow!("no GPU adapter")))
+}
+
+/// Size of a picture's chroma planes: half each way for 4:2:0, full for 4:4:4.
+fn chroma_size(pic: &Picture<'_>) -> (u32, u32) {
+    match pic.format {
+        PictureFormat::I444 | PictureFormat::Nv24 => (pic.width, pic.height),
+        _ => (pic.width.div_ceil(2), pic.height.div_ceil(2)),
+    }
 }
 
 pub struct Renderer {

@@ -9,7 +9,7 @@ use std::net::IpAddr;
 use std::time::UNIX_EPOCH;
 
 use egui::{Align, Color32, Layout, RichText, Ui};
-use silkscreen_proto::{Codec, PROTOCOL_VERSION};
+use silkscreen_proto::{Codec, PROTOCOL_VERSION, RELEASES_URL};
 use tracing::Level;
 
 use super::MIN_DATAGRAM_LEN;
@@ -286,14 +286,20 @@ fn app_card(ui: &mut Ui, st: &mut UiState) {
             let label = |l: LoginStart| match l {
                 LoginStart::Window => "Open the window".to_owned(),
                 LoginStart::Tray => format!("Stay in the {place}"),
-                LoginStart::Display => "Start display mode".to_owned(),
+                LoginStart::Display => "Start display mode, full screen".to_owned(),
+                LoginStart::DisplayWindowed => "Start display mode in a window".to_owned(),
             };
             ui.horizontal(|ui| {
                 ui.label("When it starts:");
                 egui::ComboBox::from_id_salt("login-start")
                     .selected_text(label(a.login_start))
                     .show_ui(ui, |ui| {
-                        for l in [LoginStart::Window, LoginStart::Tray, LoginStart::Display] {
+                        for l in [
+                            LoginStart::Window,
+                            LoginStart::Tray,
+                            LoginStart::Display,
+                            LoginStart::DisplayWindowed,
+                        ] {
                             ui.selectable_value(&mut a.login_start, l, label(l));
                         }
                     });
@@ -723,6 +729,12 @@ fn stream_options(
             ));
             ui.end_row();
         });
+        ui.checkbox(&mut st.full_color, "Full colour detail (4:4:4)")
+            .on_hover_text(
+                "Keeps every pixel's own colour, so coloured text and thin lines stay sharp. \
+                 Uses more bandwidth, and software encoding unless this computer's hardware \
+                 supports it (NVIDIA, PyroWave). Both computers need Silkscreen 0.2.1 or newer.",
+            );
         ui.checkbox(
             &mut st.reconnect,
             "Reconnect automatically if the display goes away",
@@ -769,11 +781,33 @@ fn display_row(
                     if let Some(k) = d.key {
                         info.push_str(&format!("  ·  {}", fingerprint(&k)));
                     }
+                    if !d.version.is_empty() {
+                        info.push_str(&format!("  ·  v{}", d.version));
+                    }
                     ui.label(RichText::new(info).weak());
                 });
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     if !compatible {
-                        ui.label(RichText::new("needs update").color(WARN));
+                        // Say which side is behind, so the user updates the
+                        // right computer.
+                        let (label, hover) = if d.protocol < PROTOCOL_VERSION {
+                            (
+                                "Update this display",
+                                "It runs an older Silkscreen than this computer.",
+                            )
+                        } else {
+                            (
+                                "Update this computer",
+                                "The display runs a newer Silkscreen than this computer.",
+                            )
+                        };
+                        ui.hyperlink_to(RichText::new(label).color(WARN), RELEASES_URL)
+                            .on_hover_text(format!(
+                                "{hover} Their versions can't work together \
+                                 (protocol {} on the display, {PROTOCOL_VERSION} here). \
+                                 Click to open the download page.",
+                                d.protocol
+                            ));
                     } else if connected {
                         ui.label(RichText::new("connected").color(GOOD));
                     } else if !own {
@@ -1221,6 +1255,10 @@ pub fn display_waiting(ui: &mut Ui, st: &mut UiState, v: &View, actions: &mut Ve
                             .size(16.0)
                             .weak(),
                         );
+                        if let Some(notice) = v.display.as_ref().and_then(|d| d.notice.as_ref()) {
+                            ui.add_space(12.0);
+                            ui.label(RichText::new(notice).size(16.0).color(WARN));
+                        }
                     }
                 }
                 ui.add_space(24.0);

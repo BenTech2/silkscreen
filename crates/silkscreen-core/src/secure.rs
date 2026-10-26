@@ -22,7 +22,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use silkscreen_proto::{
     ControlMsg, FrameError, HandshakeMsg, PROTOCOL_VERSION, VideoKey, read_frame, read_msg,
-    write_frame, write_msg,
+    version_mismatch, write_frame, write_msg,
 };
 use snow::{Builder, HandshakeState, TransportState};
 use spake2::{Ed25519Group, Identity as SpakeId, Password, Spake2};
@@ -299,6 +299,19 @@ impl std::fmt::Display for Refused {
 
 impl std::error::Error for Refused {}
 
+/// A display turned a host away because their protocol versions differ;
+/// the message says which to update.
+#[derive(Debug)]
+pub struct VersionMismatch(pub String);
+
+impl std::fmt::Display for VersionMismatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for VersionMismatch {}
+
 fn send(s: &mut TcpStream, m: &HandshakeMsg) -> Result<()> {
     write_msg(s, m)?;
     Ok(())
@@ -401,9 +414,7 @@ pub fn connect(
             knows_you,
         } => {
             if protocol != PROTOCOL_VERSION {
-                bail!(
-                    "display speaks protocol {protocol}, this host {PROTOCOL_VERSION}; update both"
-                );
+                return Err(Refused(version_mismatch(PROTOCOL_VERSION, protocol)).into());
             }
             (name, key, knows_you)
         }
@@ -492,16 +503,14 @@ pub fn accept(
             key,
         } => {
             if protocol != PROTOCOL_VERSION {
-                let reason = format!(
-                    "host speaks protocol {protocol}, this display {PROTOCOL_VERSION}; update both"
-                );
+                let reason = version_mismatch(protocol, PROTOCOL_VERSION);
                 let _ = send(
                     &mut stream,
                     &HandshakeMsg::Reject {
                         reason: reason.clone(),
                     },
                 );
-                bail!(reason);
+                return Err(VersionMismatch(reason).into());
             }
             (name, key)
         }
@@ -725,5 +734,57 @@ mod tests {
         ds.add("host", &host.public);
         let (h, d) = run(&host, &hs, &disp, &ds, "123456");
         assert!(h.unwrap().newly_paired && d.unwrap().newly_paired);
+    }
+
+    #[test]
+    fn older_host_is_told_to_update() {
+        let (disp, ds) = (id(), store());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::scope(|s| {
+            let d = s.spawn(|| {
+                let (c, _) = l.accept().unwrap();
+                accept(c, &disp, &ds, "display", None, &|_| Ok(()), &|_| {})
+            });
+            // What an older host sends.
+            let mut c = TcpStream::connect(addr).unwrap();
+            let hello = HandshakeMsg::ClientHello {
+                protocol: PROTOCOL_VERSION - 1,
+                name: "old host".into(),
+                key: id().public,
+            };
+            send(&mut c, &hello).unwrap();
+            let reason = recv(&mut c).unwrap_err().to_string();
+            assert!(reason.contains("Update the host"), "{reason}");
+            let err = d.join().unwrap().unwrap_err();
+            assert!(err.downcast_ref::<VersionMismatch>().is_some());
+        });
+    }
+
+    #[test]
+    fn older_display_is_named_by_the_host() {
+        let (host, hs) = (id(), store());
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                // What an older display replies.
+                let (mut c, _) = l.accept().unwrap();
+                read_msg::<_, HandshakeMsg>(&mut c).unwrap();
+                let hello = HandshakeMsg::ServerHello {
+                    protocol: PROTOCOL_VERSION - 1,
+                    name: "old display".into(),
+                    key: id().public,
+                    knows_you: false,
+                };
+                send(&mut c, &hello).unwrap();
+            });
+            let c = TcpStream::connect(addr).unwrap();
+            let err = connect(c, &host, &hs, "host", &mut |_| Ok(String::new())).unwrap_err();
+            let r = err
+                .downcast_ref::<Refused>()
+                .expect("a refusal, not retried");
+            assert!(r.0.contains("Update the display"), "{}", r.0);
+        });
     }
 }

@@ -50,6 +50,9 @@ pub struct HostOptions {
     /// Send at most this many frames a second (the screen itself keeps its
     /// refresh rate): fewer frames for a slow link.
     pub max_fps: Option<f32>,
+    /// Full-resolution colour (4:4:4): sharper coloured text, more data,
+    /// software encoders unless the hardware can (NVENC, PyroWave).
+    pub chroma444: bool,
 }
 
 impl HostOptions {
@@ -67,12 +70,14 @@ impl HostOptions {
             self.bitrate_kbps,
             self.datagram_len,
             self.max_fps,
+            self.chroma444,
         ) != (
             o.codec,
             &o.encoder,
             o.bitrate_kbps,
             o.datagram_len,
             o.max_fps,
+            o.chroma444,
         )
     }
 }
@@ -354,7 +359,11 @@ fn resolve_target(target: Option<&str>) -> Result<SocketAddr> {
 }
 
 /// Codecs to try, in the display's order of preference, that we can encode.
-fn codec_candidates(caps: &DisplayCaps, forced: Option<Codec>) -> Result<Vec<Codec>> {
+fn codec_candidates(
+    caps: &DisplayCaps,
+    forced: Option<Codec>,
+    chroma444: bool,
+) -> Result<Vec<Codec>> {
     if let Some(c) = forced {
         if !caps.decoders.contains(&c) {
             return Err(Refused(format!("\"{}\" can't decode {}", caps.name, c.name())).into());
@@ -363,12 +372,17 @@ fn codec_candidates(caps: &DisplayCaps, forced: Option<Codec>) -> Result<Vec<Cod
     }
     // PyroWave is experimental and needs Ethernet-class bandwidth: only
     // when picked.
-    let codecs: Vec<_> = caps
+    let mut codecs: Vec<_> = caps
         .decoders
         .iter()
         .copied()
         .filter(|&c| c != Codec::PyroWave && !compiled_encoders(c).is_empty())
         .collect();
+    // 4:4:4 mostly means software encoding, where x264 is much faster
+    // than x265.
+    if chroma444 {
+        codecs.sort_by_key(|&c| c != Codec::H264);
+    }
     if codecs.is_empty() {
         bail!("no codec in common with the display ({:?})", caps.decoders);
     }
@@ -430,7 +444,7 @@ fn run_session(
         caps.decoders
     );
 
-    let mut codecs = codec_candidates(&caps, opts.codec)?;
+    let mut codecs = codec_candidates(&caps, opts.codec, opts.chroma444)?;
     let (mode_w, mode_h, scale) = stream_mode(&caps, opts.resolution);
     if (mode_w, mode_h) != (caps.width, caps.height) && opts.size.is_none() {
         info!(
@@ -483,8 +497,10 @@ fn run_session(
     let keyframe = Arc::new(AtomicBool::new(true));
     let rtt_us = Arc::new(AtomicU64::new(0));
     let ended_by_display = Arc::new(AtomicBool::new(false));
+    let heard = Heartbeat::new();
     let reader_thread = {
         let ended_by_display = ended_by_display.clone();
+        let heard = heard.clone();
         let (stop, keyframe, rtt_us, writer, state) = (
             stop.clone(),
             keyframe.clone(),
@@ -497,7 +513,11 @@ fn run_session(
             .spawn(move || {
                 let mut input = KeyTracker::new(input);
                 loop {
-                    match reader.recv() {
+                    let msg = reader.recv();
+                    if msg.is_ok() {
+                        heard.beat();
+                    }
+                    match msg {
                         Ok(ControlMsg::RequestKeyframe) => keyframe.store(true, Ordering::Relaxed),
                         Ok(ControlMsg::Input(ev)) => input.inject(&ev),
                         Ok(ControlMsg::Ping { t_us }) => {
@@ -535,7 +555,7 @@ fn run_session(
 
     let result: Result<Ended> = if let Some(sub) = &mirror {
         mirror_loop(
-            sub, opts, control, &writer, &udp, &video_key, &stop, &keyframe, &rtt_us,
+            sub, opts, control, &writer, &udp, &video_key, &stop, &keyframe, &rtt_us, &heard,
         )
     } else {
         let capturer = capturer.as_mut().unwrap();
@@ -549,7 +569,7 @@ fn run_session(
                     }
                     if new.encoder_differs(opts) {
                         info!("new stream settings: restarting the encoder");
-                        codecs = codec_candidates(&caps, new.codec)?;
+                        codecs = codec_candidates(&caps, new.codec, new.chroma444)?;
                         stream = None;
                         pacer.set_max_fps(new.max_fps);
                     }
@@ -609,6 +629,7 @@ fn run_session(
 
                 if last_ping.elapsed() >= Duration::from_secs(1) {
                     last_ping = Instant::now();
+                    heard.check()?;
                     writer.send(&ControlMsg::Ping { t_us: now_us() })?;
                     if let Some(s) = &stream {
                         stats.report(
@@ -634,12 +655,44 @@ fn run_session(
     result
 }
 
+/// When the display was last heard from. It answers the once-a-second pings,
+/// so a long silence means it is gone (asleep, off the network) even if the
+/// TCP connection has not noticed yet — which can take many minutes.
+#[derive(Clone)]
+struct Heartbeat(Arc<Mutex<Instant>>);
+
+/// How long a display may stay silent before the session is given up and
+/// reconnected.
+const SILENCE_LIMIT: Duration = Duration::from_secs(8);
+
+impl Heartbeat {
+    fn new() -> Self {
+        Heartbeat(Arc::new(Mutex::new(Instant::now())))
+    }
+
+    fn beat(&self) {
+        *self.0.lock().unwrap() = Instant::now();
+    }
+
+    fn check(&self) -> Result<()> {
+        let silent = self.0.lock().unwrap().elapsed();
+        if silent > SILENCE_LIMIT {
+            bail!(
+                "the display stopped responding ({}s without a reply)",
+                silent.as_secs()
+            );
+        }
+        Ok(())
+    }
+}
+
 fn mirror_settings(opts: &HostOptions) -> mirror::Settings {
     mirror::Settings {
         codec: opts.codec,
         encoder: opts.encoder.clone(),
         bitrate_kbps: opts.bitrate_kbps,
         max_fps: opts.max_fps,
+        chroma444: opts.chroma444,
     }
 }
 
@@ -655,6 +708,7 @@ fn mirror_loop(
     stop: &AtomicBool,
     keyframe: &AtomicBool,
     rtt_us: &AtomicU64,
+    heard: &Heartbeat,
 ) -> Result<Ended> {
     let mut packetizer: Option<Packetizer> = None;
     let mut stream_id = 0;
@@ -731,6 +785,7 @@ fn mirror_loop(
         }
         if last_ping.elapsed() >= Duration::from_secs(1) {
             last_ping = Instant::now();
+            heard.check()?;
             writer.send(&ControlMsg::Ping { t_us: now_us() })?;
             if packetizer.is_some() {
                 stats.set_encode_ms(sub.encode_ms());
@@ -850,6 +905,7 @@ fn ensure_stream<'a>(
             refresh_mhz,
             bitrate_kbps,
             encoder: opts.encoder.clone(),
+            chroma444: opts.chroma444,
         };
         Encoder::open(&cfg)
             .map_err(|e| errors.push(format!("{e:#}")))
