@@ -35,8 +35,10 @@ pub enum LoginStart {
     Window,
     /// Stay in the system tray (needs the tray icon).
     Tray,
-    /// Go straight into display mode.
+    /// Go straight into display mode, full screen.
     Display,
+    /// Go straight into display mode in a window.
+    DisplayWindowed,
 }
 
 /// The app itself: tray icon and starting at login (both off by default).
@@ -101,6 +103,8 @@ pub struct StreamPrefs {
     pub refresh_hz: Option<f32>,
     /// Send at most this many frames a second; `None` = every frame.
     pub max_fps: Option<u32>,
+    /// Full-resolution colour (4:4:4).
+    pub full_color: bool,
     pub datagram_len: usize,
     /// Reconnect when the display goes away (`--once` turns this off).
     pub reconnect: bool,
@@ -119,6 +123,7 @@ impl Default for StreamPrefs {
             size: None,
             refresh_hz: None,
             max_fps: None,
+            full_color: false,
             datagram_len: DEFAULT_DATAGRAM_LEN,
             reconnect: true,
         }

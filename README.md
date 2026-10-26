@@ -50,6 +50,7 @@ Grab the file for your system from the [Releases](https://github.com/BenTech2/si
 |---|---|---|
 | Windows 10/11 (x64) | `silkscreen-windows-x64.zip` | Unzip anywhere, run `silkscreen.exe`. The app isn't code-signed yet, so Windows may say *Windows protected your PC*: choose **More info → Run anyway**. Allow it on *Private* networks when the firewall asks. |
 | macOS 12.3+ (Apple Silicon) | `silkscreen-macos-arm64.zip` | Unzip, then run `xattr -dr com.apple.quarantine silkscreen-macos-arm64` once (the build isn't notarized) and open `Silkscreen.app`. From a terminal: `Silkscreen.app/Contents/MacOS/silkscreen`. |
+| macOS 11+ on Intel (e.g. the 2014–2019 Retina iMacs) | `silkscreen-macos-intel.zip` | Same as above. Made to turn a Retina iMac into a wireless display; sharing that Mac's own screen needs macOS 12.3+. |
 | Linux x86_64 | `silkscreen-linux-x86_64.tar.gz` | `tar xf` it and run `./silkscreen`. Bundles its own FFmpeg; needs glibc 2.36+ (Debian 12, Ubuntu 22.10, Fedora 37 or newer) and PipeWire. |
 | Raspberry Pi 4 / 5 (64-bit Raspberry Pi OS) | `silkscreen-linux-aarch64.tar.gz` | Same as Linux. Best as a **display**: the Pi 4 decodes H.264 in hardware, the Pi 5 in software (fine at 1080p60). |
 | Android 11+ phones and tablets | `silkscreen-android.apk` | Install the APK (allow installs from your browser/file manager). Display only. |
@@ -94,6 +95,25 @@ or `--max-fps 30`) sends fewer frames so the link keeps up, without changing
 the screen's own refresh rate. The debug overlay shows how far behind the
 picture is.
 
+**Full colour detail (4:4:4).** Video normally keeps colour at half
+resolution, which is invisible in photos and video but makes thin coloured
+text and lines look soft. *Stream options → Full colour detail (4:4:4)* (or
+`--full-color`) sends full-resolution colour using H.264 4:4:4 (software
+x264 on the host, so it costs more CPU) or PyroWave. Both computers need
+Silkscreen 0.2.1 or later.
+
+**Sleep and dropped connections.** If the display stops answering for 8
+seconds (it went to sleep, or the Wi-Fi dropped), the host gives up on that
+session and keeps trying to reconnect. A display that hears nothing from its
+host for 15 seconds frees itself for the next connection, and a host that
+comes back from the same computer replaces its old, dead session straight
+away instead of being told the display is in use.
+
+**Different versions.** When two computers' Silkscreen versions can't work
+together, the host's display list says which one to update (with a link to
+the downloads) and the display's waiting screen says the same when an
+incompatible host tries to connect.
+
 Stream options change live while connected: bitrate, codec, encoder and
 packet size switch in place; source, resolution, size and refresh rate
 reconnect for a moment.
@@ -105,8 +125,8 @@ Under **App** (both off until you turn them on):
   shows the status and can disconnect, start or stop display mode, reopen
   the window or quit.
 - **Start Silkscreen when I log in**, opening the window, staying in the tray,
-  or going straight into display mode (handy for a computer that is always a
-  display). Uses the per-user Run key on Windows, a LaunchAgent on macOS and
+  or going straight into display mode, full screen or in a window (handy for
+  a computer that is always a display). Uses the per-user Run key on Windows, a LaunchAgent on macOS and
   `~/.config/autostart` on Linux.
 
 ### Pairing and security
@@ -140,6 +160,7 @@ silkscreen paired             # list paired devices
 | `host` | `--resolution auto\|full\|half` | `auto` (default) streams panels above 4K at half resolution — a 4500×3000 Surface Studio as 2250×1500 — for low latency; `full` is sharpest but adds latency (also in the app under *Stream options*) |
 | `host` | `--codec hevc\|h264\|av1\|pyrowave`, `--bitrate 80` | override codec / Mbit/s |
 | `host` | `--size 2560x1440 --refresh 60` | override the display's native mode |
+| `host` | `--full-color` | full-resolution colour (4:4:4), sharper coloured text; H.264 or PyroWave |
 | `host` | `--mtu 8900` | larger UDP datagrams on a jumbo-frame Ethernet network |
 | `host` | `--source test-pattern` | animated pattern that draws touch points — tests everything except capture |
 | `display` | `--windowed`, `--monitor N` | window instead of fullscreen / which monitor |
@@ -245,10 +266,20 @@ cargo build --release
 
 Release bundles (each ships its own FFmpeg):
 
-- Windows, cross-compiled from Linux: `FFMPEG_DIR=… scripts/package-windows.sh`
-- Linux x86_64 / Raspberry Pi: `scripts/package-linux.sh x86_64|aarch64` (in a Debian 12 container; aarch64 via qemu)
+- Windows, cross-compiled from Linux or macOS: `FFMPEG_DIR=… scripts/package-windows.sh`
+- macOS on Intel (macOS 11+), cross-compiled on Apple Silicon with its own FFmpeg: `scripts/package-macos-intel.sh`
+- Linux x86_64 / Raspberry Pi: `scripts/package-linux.sh x86_64|aarch64` (in a Debian 12 container with podman or Docker; aarch64 builds natively in ~2 minutes on an Apple Silicon Mac, but takes hours under qemu on an x86 machine)
 - Android: `scripts/build-android.sh`
-- macOS: built by `.github/workflows/release.yml` when a release is published
+- macOS (Apple Silicon): `scripts/package-macos.sh` (`--install` copies it to /Applications)
+
+Releases are built this way on an Apple Silicon Mac and uploaded by hand; `.github/workflows/release.yml` can build the macOS and Linux x86_64 files on GitHub instead when started by hand.
+
+macOS ties its privacy permissions (Screen Recording, Accessibility) to the
+app's signature. Without a paid Developer ID every build is signed ad hoc,
+so the permissions have to be granted again after each update. Run
+`scripts/macos-signing-setup.sh` once to make a local self-signed signing
+identity; the packaging scripts then sign with it, and the permissions stay
+granted across rebuilds on that Mac.
 
 Workspace layout:
 

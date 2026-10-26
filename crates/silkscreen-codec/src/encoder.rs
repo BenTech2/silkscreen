@@ -8,7 +8,7 @@ use ffmpeg_sys_next as ff;
 use silkscreen_proto::Codec;
 use tracing::{debug, info};
 
-use crate::convert::{ChromaLayout, RgbFrame, YuvPlanes, rgb_to_yuv420};
+use crate::convert::{ChromaLayout, RgbFrame, YuvPlanes, rgb_to_yuv};
 use crate::ff::{
     BufRef, CodecCtx, Dict, EAGAIN, Frame, Packet, check, create_hw_device, init_logging,
 };
@@ -24,6 +24,9 @@ pub struct EncoderConfig {
     /// Force a specific FFmpeg encoder (e.g. "h264_nvenc"); otherwise the
     /// best available one is chosen.
     pub encoder: Option<String>,
+    /// Full-resolution colour (4:4:4) instead of 4:2:0. Only some encoders
+    /// can (software x264/x265, NVENC, PyroWave); others are skipped.
+    pub chroma444: bool,
 }
 
 /// Encoders to try, best first, for this platform.
@@ -185,20 +188,24 @@ impl FfEncoder {
             }
 
             let formats = supported_pix_fmts(codec);
-            let (pix_fmt, chroma, hw) =
-                if formats.is_empty() || formats.contains(&Pix::AV_PIX_FMT_NV12) {
-                    (Pix::AV_PIX_FMT_NV12, ChromaLayout::Nv12, None)
-                } else if formats.contains(&Pix::AV_PIX_FMT_YUV420P) {
-                    (Pix::AV_PIX_FMT_YUV420P, ChromaLayout::I420, None)
-                } else if formats.contains(&Pix::AV_PIX_FMT_VAAPI) {
-                    (
-                        Pix::AV_PIX_FMT_VAAPI,
-                        ChromaLayout::Nv12,
-                        Some(Hw::AV_HWDEVICE_TYPE_VAAPI),
-                    )
-                } else {
-                    bail!("no supported input pixel format");
-                };
+            let (pix_fmt, chroma, hw) = if cfg.chroma444 {
+                if !formats.is_empty() && !formats.contains(&Pix::AV_PIX_FMT_YUV444P) {
+                    bail!("no 4:4:4 input");
+                }
+                (Pix::AV_PIX_FMT_YUV444P, ChromaLayout::I444, None)
+            } else if formats.is_empty() || formats.contains(&Pix::AV_PIX_FMT_NV12) {
+                (Pix::AV_PIX_FMT_NV12, ChromaLayout::Nv12, None)
+            } else if formats.contains(&Pix::AV_PIX_FMT_YUV420P) {
+                (Pix::AV_PIX_FMT_YUV420P, ChromaLayout::I420, None)
+            } else if formats.contains(&Pix::AV_PIX_FMT_VAAPI) {
+                (
+                    Pix::AV_PIX_FMT_VAAPI,
+                    ChromaLayout::Nv12,
+                    Some(Hw::AV_HWDEVICE_TYPE_VAAPI),
+                )
+            } else {
+                bail!("no supported input pixel format");
+            };
 
             let ctx = CodecCtx(ff::avcodec_alloc_context3(codec));
             if ctx.0.is_null() {
@@ -269,6 +276,7 @@ impl FfEncoder {
             f.format = match chroma {
                 ChromaLayout::Nv12 => Pix::AV_PIX_FMT_NV12,
                 ChromaLayout::I420 => Pix::AV_PIX_FMT_YUV420P,
+                ChromaLayout::I444 => Pix::AV_PIX_FMT_YUV444P,
             } as i32;
             f.width = c.width;
             f.height = c.height;
@@ -316,20 +324,25 @@ impl FfEncoder {
                 );
             }
             let h = f.height as usize;
+            let ch = if self.chroma == ChromaLayout::I444 {
+                h
+            } else {
+                h / 2
+            };
             let plane = |i: usize, rows: usize| {
                 std::slice::from_raw_parts_mut(f.data[i], f.linesize[i] as usize * rows)
             };
             let dst = YuvPlanes {
                 y: plane(0, h),
                 y_stride: f.linesize[0] as usize,
-                u: plane(1, h / 2),
+                u: plane(1, ch),
                 u_stride: f.linesize[1] as usize,
                 v: match self.chroma {
                     ChromaLayout::Nv12 => None,
-                    ChromaLayout::I420 => Some((plane(2, h / 2), f.linesize[2] as usize)),
+                    _ => Some((plane(2, ch), f.linesize[2] as usize)),
                 },
             };
-            rgb_to_yuv420(src, dst, self.chroma);
+            rgb_to_yuv(src, dst, self.chroma);
         }
         self.submit(pts_us, force_keyframe, &mut emit)
     }

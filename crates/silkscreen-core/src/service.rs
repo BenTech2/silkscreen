@@ -54,6 +54,8 @@ struct ServiceShared {
     /// A host is connected (or pairing).
     busy: AtomicBool,
     current: Mutex<Option<SecureWriter>>,
+    /// Address of the host in the current session.
+    current_peer: Mutex<Option<IpAddr>>,
 }
 
 impl ServiceHandle {
@@ -133,6 +135,7 @@ pub fn spawn(
         catch_up_ms: AtomicU32::new(0),
         busy: AtomicBool::new(false),
         current: Mutex::new(None),
+        current_peer: Mutex::new(None),
     });
     let (video_tx, video_rx) = crossbeam_channel::unbounded();
     let (input_tx, input_rx) = crossbeam_channel::unbounded::<InputEvent>();
@@ -212,9 +215,16 @@ fn is_disconnect(e: &anyhow::Error) -> bool {
     use std::io::ErrorKind::*;
     matches!(
         e.downcast_ref::<silkscreen_proto::FrameError>(),
-        Some(silkscreen_proto::FrameError::Io(io)) if matches!(io.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted)
+        Some(silkscreen_proto::FrameError::Io(io)) if matches!(io.kind(), UnexpectedEof | ConnectionReset | ConnectionAborted | TimedOut | WouldBlock)
     )
 }
+
+/// How long a host may stay silent before its session is dropped. Hosts
+/// ping every second once streaming, so this only passes when the host is
+/// gone (asleep, off the network), which TCP itself can take many minutes
+/// to notice. Generous, because a Windows host can be quiet for several
+/// seconds while its virtual monitor is plugged in.
+const SILENCE_LIMIT: Duration = Duration::from_secs(15);
 
 /// Runs one host connection. `Ok(None)` means the host was refused up front.
 fn session(
@@ -230,14 +240,34 @@ fn session(
     let peer = conn.peer_addr()?.ip();
     let admitted = AtomicBool::new(false);
     let admit = |host: &str| -> Result<(), String> {
-        if shared
-            .busy
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_err()
-        {
-            return Err("the display is in use by another host".into());
+        let take = || {
+            shared
+                .busy
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        };
+        if !take() {
+            // The same computer coming back (after sleep, a network drop or
+            // a restart) means its old session is dead: replace it rather
+            // than refuse.
+            if *shared.current_peer.lock().unwrap() != Some(peer) {
+                return Err("the display is in use by another host".into());
+            }
+            info!("host at {peer} reconnected; closing its old session");
+            if let Some(w) = shared.current.lock().unwrap().as_ref() {
+                w.shutdown();
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while !take() {
+                if Instant::now() > deadline {
+                    return Err("the display is in use by another host".into());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
         }
+        *shared.current_peer.lock().unwrap() = Some(peer);
         admitted.store(true, Ordering::Relaxed);
+        state.update(|s| s.notice = None);
         info!("host \"{host}\" connecting from {peer}");
         Ok(())
     };
@@ -265,6 +295,7 @@ fn session(
         let host_name = channel.peer_name.clone();
         let writer = channel.writer()?;
         let mut reader = channel.reader()?;
+        channel.stream.set_read_timeout(Some(SILENCE_LIMIT))?;
         *shared.current.lock().unwrap() = Some(writer.clone());
         writer.send(&ControlMsg::Caps(caps.clone()))?;
         info!("host \"{host_name}\" connected from {peer}");
@@ -311,13 +342,19 @@ fn session(
         }
     })();
     if !admitted.load(Ordering::Relaxed) {
-        return result.map(|_| None).or_else(|e| {
+        return result.map(|_| None).or_else(|e: anyhow::Error| {
+            if let Some(m) = e.downcast_ref::<secure::VersionMismatch>() {
+                // Worth showing: otherwise the display just keeps waiting
+                // while the host's user wonders why nothing happens.
+                warn!("turned away host at {peer}: {m}");
+                state.update(|s| s.notice = Some(m.to_string()));
+            }
             debug!("refused connection: {e:#}");
             Ok(None)
         });
     }
-    *shared.current.lock().unwrap() = None;
-    shared.busy.store(false, Ordering::Release);
+    // Tidy up before letting the next host in, so this session's Stop can't
+    // land after the next one's Start.
     let _ = video_tx.send(VideoCtl::Stop);
     state.update(|s| {
         s.phase = DisplayPhase::Waiting;
@@ -326,6 +363,19 @@ fn session(
         s.fps = 0.0;
         s.latency_ms = 0.0;
     });
+    *shared.current.lock().unwrap() = None;
+    *shared.current_peer.lock().unwrap() = None;
+    shared.busy.store(false, Ordering::Release);
+    if let Err(e) = &result
+        && is_disconnect(e)
+        && matches!(
+            e.downcast_ref::<silkscreen_proto::FrameError>(),
+            Some(silkscreen_proto::FrameError::Io(io))
+                if matches!(io.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock)
+        )
+    {
+        info!("host {peer} stopped responding; ready for the next connection");
+    }
     result.map(Some)
 }
 
@@ -372,6 +422,16 @@ impl Lag {
         self.baseline = Some((base, Instant::now()));
         (gap - base) as f32 / 1000.0
     }
+}
+
+/// Whether datagrams are already waiting in the socket (a local backlog).
+fn backlog(udp: &UdpSocket, buf: &mut [u8]) -> bool {
+    if udp.set_nonblocking(true).is_err() {
+        return false;
+    }
+    let waiting = udp.peek_from(buf).is_ok();
+    let _ = udp.set_nonblocking(false);
+    waiting
 }
 
 /// Throws away every datagram already waiting in the socket.
@@ -452,13 +512,21 @@ fn video_thread(
             let behind = lag.behind_ms(frame.first_packet_at, frame.pts_us);
             worst_behind = worst_behind.max(behind);
             let limit = shared.catch_up_ms.load(Ordering::Relaxed) as f32;
-            if skipping && frame.keyframe {
+            // The keyframe that ends a skip is always shown, late or not.
+            let resumes = skipping && frame.keyframe;
+            if resumes {
                 skipping = false;
             }
+            // Skipping only helps when frames are queued up here (this
+            // display falling behind). When they are late because the
+            // network is slow, nothing is queued and dropping frames would
+            // only freeze the picture.
             if !skipping
+                && !resumes
                 && limit > 0.0
                 && behind > limit
                 && last_catch_up.is_none_or(|t| t.elapsed() > Duration::from_secs(1))
+                && backlog(&udp, &mut buf)
             {
                 // Showing these late frames only keeps the picture behind:
                 // drop everything queued and start again from a keyframe.
