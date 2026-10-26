@@ -9,6 +9,7 @@
 # submodules (scripts/fetch-submodules.sh). The release workflow runs this.
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/no-home-paths.sh
 
 cargo build --release -p silkscreen
 
@@ -16,6 +17,8 @@ out=dist/silkscreen-macos-arm64
 app=$out/Silkscreen.app/Contents
 rm -rf "$out" && mkdir -p "$app/MacOS" "$app/Frameworks" "$app/Resources"
 cp target/release/silkscreen "$app/MacOS/"
+# Drop the debug map (paths to the build's object files); symbols stay.
+strip -S "$app/MacOS/silkscreen"
 # Copy Homebrew's FFmpeg and its dependencies into the bundle.
 dylibbundler -od -b -x "$app/MacOS/silkscreen" -d "$app/Frameworks" \
     -p @executable_path/../Frameworks/ >/dev/null
@@ -43,6 +46,7 @@ codesign --force -s "$sign_id" "$out/Silkscreen.app"
 cp README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md "$out/"
 cp third_party/pyrowave/LICENSE "$out/PYROWAVE-LICENSE.txt"
 "$app/MacOS/silkscreen" doctor >/dev/null
+check_no_home_paths "$out"
 (cd dist && rm -f silkscreen-macos-arm64.zip && zip -qry silkscreen-macos-arm64.zip silkscreen-macos-arm64)
 echo "built dist/silkscreen-macos-arm64.zip (Silkscreen $version)"
 
