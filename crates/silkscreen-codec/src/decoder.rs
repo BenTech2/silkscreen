@@ -39,6 +39,11 @@ pub enum PictureFormat {
     Nv12,
     /// Y, U, V planes.
     I420,
+    /// Y, U, V planes, all full size (4:4:4).
+    I444,
+    /// Y plane + interleaved UV plane, both full size (4:4:4; what
+    /// VideoToolbox decodes 4:4:4 to).
+    Nv24,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,13 +243,29 @@ impl FfDecoder {
             || f.format == Pix::AV_PIX_FMT_YUVJ420P as i32
         {
             PictureFormat::I420
+        } else if f.format == Pix::AV_PIX_FMT_YUV444P as i32
+            || f.format == Pix::AV_PIX_FMT_YUVJ444P as i32
+        {
+            PictureFormat::I444
+        } else if f.format == Pix::AV_PIX_FMT_NV24 as i32 {
+            PictureFormat::Nv24
         } else {
             warn!("unsupported decoded pixel format {}", f.format);
             return Ok(None);
         };
         let h = f.height as usize;
-        let rows = |i: usize| if i == 0 { h } else { h.div_ceil(2) };
-        let n = if format == PictureFormat::Nv12 { 2 } else { 3 };
+        let rows = |i: usize| {
+            if i == 0 || matches!(format, PictureFormat::I444 | PictureFormat::Nv24) {
+                h
+            } else {
+                h.div_ceil(2)
+            }
+        };
+        let n = if matches!(format, PictureFormat::Nv12 | PictureFormat::Nv24) {
+            2
+        } else {
+            3
+        };
         let planes = (0..n)
             .map(|i| {
                 let stride = f.linesize[i] as usize;
@@ -265,7 +286,8 @@ impl FfDecoder {
                 _ => Matrix::Bt709,
             },
             full_range: f.color_range == ff::AVColorRange::AVCOL_RANGE_JPEG
-                || f.format == Pix::AV_PIX_FMT_YUVJ420P as i32,
+                || f.format == Pix::AV_PIX_FMT_YUVJ420P as i32
+                || f.format == Pix::AV_PIX_FMT_YUVJ444P as i32,
             planes,
         }))
     }
@@ -305,6 +327,7 @@ pub fn decodable_codecs() -> Vec<Codec> {
     } else {
         [Codec::Hevc, Codec::H264, Codec::Av1]
     };
+    #[cfg_attr(not(feature = "pyrowave"), allow(unused_mut))]
     let mut codecs: Vec<_> = order
         .into_iter()
         .filter(|c| {

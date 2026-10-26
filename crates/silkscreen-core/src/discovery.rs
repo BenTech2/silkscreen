@@ -39,6 +39,7 @@ pub fn advertise(name: &str, port: u16, key: &[u8; 32], s: &Summary) -> Result<A
         ("mhz", s.refresh_mhz.to_string()),
         ("touch", (s.touch as u8).to_string()),
         ("proto", PROTOCOL_VERSION.to_string()),
+        ("ver", env!("CARGO_PKG_VERSION").to_string()),
     ];
     // The instance name must be unique on the LAN; the key prefix makes it so
     // even when two devices share a display name.
@@ -72,6 +73,8 @@ pub struct FoundDisplay {
     pub key: Option<[u8; 32]>,
     pub summary: Summary,
     pub protocol: u16,
+    /// The display's Silkscreen version ("0.2.1"); empty before 0.2.1.
+    pub version: String,
 }
 
 fn parse(svc: &ResolvedService) -> Option<FoundDisplay> {
@@ -96,6 +99,7 @@ fn parse(svc: &ResolvedService) -> Option<FoundDisplay> {
             touch: num("touch") != 0,
         },
         protocol: num("proto") as u16,
+        version: prop("ver"),
     })
 }
 

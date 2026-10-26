@@ -29,6 +29,12 @@ unmodified, as separate shared libraries.
   it, and all of its source code is in this repository. FFmpeg's source code:
   <https://github.com/FFmpeg/FFmpeg>; the formula lists the exact version and
   build options. `silkscreen doctor` prints the FFmpeg version in use.
+- **The macOS app for Intel Macs** includes FFmpeg 8.1 built for it by
+  `scripts/package-macos-intel.sh` (VideoToolbox, no other external
+  libraries), licensed under the **GNU Lesser General Public License v2.1 or
+  later** (included as `FFMPEG-LICENSE.txt`). Source:
+  <https://ffmpeg.org/releases/ffmpeg-8.1.tar.xz>; the script shows exactly
+  how it was built.
 - **The Android app** does not include FFmpeg; it decodes with Android's
   MediaCodec.
 

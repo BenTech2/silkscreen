@@ -9,7 +9,6 @@ mod ui;
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -99,11 +98,8 @@ impl PictureSink for WindowSink {
     }
 
     fn present(&self, pic: &Picture<'_>, _first_packet_at: Instant) {
-        // Only wake the UI if it has drawn the previous frame; otherwise the
-        // pending redraw will pick up this newer picture anyway.
-        let wake = !self.video.dirty.load(Ordering::Acquire);
-        self.video.upload(pic);
-        if wake {
+        // Wake the UI unless a redraw is already on its way.
+        if self.video.upload(pic) {
             let _ = self.proxy.lock().unwrap().send_event(UiEvent::NewFrame);
         }
     }
@@ -285,8 +281,15 @@ impl App {
             // Refresh the login entry, in case the app moved.
             set_start_at_login(true);
         }
-        if self.opts.start_display || login == Some(LoginStart::Display) {
-            self.start_display(el)?;
+        // The login choice says full screen or windowed itself, whatever
+        // the "Run in a window" display option says.
+        match login {
+            Some(LoginStart::Display) => self.start_display(el, false)?,
+            Some(LoginStart::DisplayWindowed) => self.start_display(el, true)?,
+            _ if self.opts.start_display => {
+                self.start_display(el, self.ui.prefs.display.windowed)?
+            }
+            _ => {}
         }
         for target in self.opts.connect.clone() {
             self.connect(target, false);
@@ -311,7 +314,8 @@ impl App {
 
     // -- display mode -------------------------------------------------------
 
-    fn start_display(&mut self, el: &ActiveEventLoop) -> Result<()> {
+    /// Starts display mode, full screen unless `windowed`.
+    fn start_display(&mut self, el: &ActiveEventLoop, windowed: bool) -> Result<()> {
         if self.display.is_some() {
             return Ok(());
         }
@@ -362,7 +366,7 @@ impl App {
         )?;
         self.decoder = Some(decoder);
         role.service.set_catch_up(d.catch_up);
-        if !prefs.windowed {
+        if !windowed {
             g.window
                 .set_fullscreen(Some(Fullscreen::Borderless(Some(monitor))));
         }
@@ -476,7 +480,7 @@ impl App {
                     self.stop_display();
                 } else {
                     self.show_window();
-                    if let Err(e) = self.start_display(el) {
+                    if let Err(e) = self.start_display(el, self.ui.prefs.display.windowed) {
                         warn!("cannot start display mode: {e:#}");
                     }
                 }
@@ -965,6 +969,7 @@ impl App {
             persist: st.reconnect,
             resolution: st.resolution,
             max_fps: st.max_fps.map(|f| f as f32),
+            chroma444: st.full_color,
         }
     }
 }
@@ -1029,7 +1034,7 @@ impl ApplicationHandler<UiEvent> for App {
 
     fn user_event(&mut self, el: &ActiveEventLoop, ev: UiEvent) {
         if std::mem::take(&mut self.pending_start)
-            && let Err(e) = self.start_display(el)
+            && let Err(e) = self.start_display(el, self.ui.prefs.display.windowed)
         {
             warn!("cannot start display mode: {e:#}");
         }

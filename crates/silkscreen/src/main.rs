@@ -138,6 +138,10 @@ enum Command {
         /// screen keeps its refresh rate.
         #[arg(long, value_name = "FPS")]
         max_fps: Option<f32>,
+        /// Full-resolution colour (4:4:4): sharper coloured text, more data;
+        /// uses software encoding unless the hardware supports it.
+        #[arg(long)]
+        full_color: bool,
         /// Exit when the display disconnects instead of reconnecting.
         #[arg(long)]
         once: bool,
@@ -469,6 +473,7 @@ fn main() -> Result<()> {
             mtu,
             once,
             max_fps,
+            full_color,
             code,
             resolution,
         } => host::run(
@@ -492,6 +497,7 @@ fn main() -> Result<()> {
                 datagram_len: mtu,
                 persist: !once,
                 max_fps,
+                chroma444: full_color,
                 resolution: match resolution {
                     ResolutionArg::Auto => host::Resolution::Auto,
                     ResolutionArg::Full => host::Resolution::Full,

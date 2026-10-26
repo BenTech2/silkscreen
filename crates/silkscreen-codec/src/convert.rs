@@ -31,15 +31,18 @@ pub enum ChromaLayout {
     Nv12,
     /// Separate U and V planes.
     I420,
+    /// Separate U and V planes at full resolution (4:4:4): sharper colour
+    /// edges, e.g. coloured text.
+    I444,
 }
 
 pub struct YuvPlanes<'a> {
     pub y: &'a mut [u8],
     pub y_stride: usize,
-    /// NV12: interleaved UV. I420: U.
+    /// NV12: interleaved UV. I420 / I444: U.
     pub u: &'a mut [u8],
     pub u_stride: usize,
-    /// I420 only.
+    /// I420 and I444 only.
     pub v: Option<(&'a mut [u8], usize)>,
 }
 
@@ -64,6 +67,39 @@ fn chroma(r: i32, g: i32, b: i32) -> (u8, u8) {
     let u = ((-26 * r - 86 * g + 112 * b + 512) >> 10) + 128;
     let v = ((112 * r - 102 * g - 10 * b + 512) >> 10) + 128;
     (u.clamp(0, 255) as u8, v.clamp(0, 255) as u8)
+}
+
+/// Converts `src` into `dst` in the given layout.
+pub fn rgb_to_yuv(src: &RgbFrame, dst: YuvPlanes, chroma_layout: ChromaLayout) {
+    match chroma_layout {
+        ChromaLayout::I444 => rgb_to_yuv444(src, dst),
+        _ => rgb_to_yuv420(src, dst, chroma_layout),
+    }
+}
+
+/// Full-resolution chroma: every pixel keeps its own colour.
+fn rgb_to_yuv444(src: &RgbFrame, dst: YuvPlanes) {
+    let w = src.width as usize;
+    let h = src.height as usize;
+    let (v_plane, v_stride) = dst.v.expect("I444 destination needs a V plane");
+    let layout = src.layout;
+    dst.y
+        .par_chunks_mut(dst.y_stride)
+        .zip(dst.u.par_chunks_mut(dst.u_stride))
+        .zip(v_plane.par_chunks_mut(v_stride))
+        .take(h)
+        .enumerate()
+        .for_each(|(row, ((yr, ur), vr))| {
+            let s = &src.data[row * src.stride..];
+            for x in 0..w {
+                let (r, g, b) = px(s, x, layout);
+                yr[x] = luma(r, g, b);
+                // `chroma` takes sums of four pixels.
+                let (u, v) = chroma(r * 4, g * 4, b * 4);
+                ur[x] = u;
+                vr[x] = v;
+            }
+        });
 }
 
 /// Converts `src` into `dst`. Width and height should be even (encoders
@@ -113,6 +149,7 @@ pub fn rgb_to_yuv420(src: &RgbFrame, dst: YuvPlanes, chroma_layout: ChromaLayout
                 });
         }
         (ChromaLayout::I420, None) => panic!("I420 destination needs a V plane"),
+        (ChromaLayout::I444, _) => unreachable!("4:4:4 goes through rgb_to_yuv444"),
     }
 }
 

@@ -83,4 +83,7 @@ pub struct DisplayState {
     pub behind_ms: f32,
     /// Times this display skipped ahead to catch up.
     pub catch_ups: u32,
+    /// Something to tell the user while waiting, e.g. that a host tried to
+    /// connect with an incompatible version. Cleared when a host gets in.
+    pub notice: Option<String>,
 }
