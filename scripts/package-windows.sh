@@ -10,6 +10,7 @@ set -euo pipefail
 
 : "${FFMPEG_DIR:?set FFMPEG_DIR to an unpacked win64 FFmpeg shared build}"
 cd "$(dirname "$0")/.."
+. scripts/no-home-paths.sh
 MINGW_INC=${MINGW_INC:-/usr/x86_64-w64-mingw32/sys-root/mingw/include}
 
 export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER=x86_64-w64-mingw32-gcc
@@ -33,5 +34,6 @@ done
 for lib in avcodec avutil swresample; do cp "$FFMPEG_DIR"/bin/$lib-*.dll "$out/"; done
 cp README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md "$out/"
 [ -f "$FFMPEG_DIR/LICENSE.txt" ] && cp "$FFMPEG_DIR/LICENSE.txt" "$out/FFMPEG-LICENSE.txt"
+check_no_home_paths "$out"
 (cd dist && rm -f silkscreen-windows-x64.zip && zip -qr silkscreen-windows-x64.zip silkscreen-windows-x64)
 echo "built dist/silkscreen-windows-x64.zip"

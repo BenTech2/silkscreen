@@ -12,6 +12,7 @@
 # x86_64-apple-darwin. Output: dist/silkscreen-macos-intel.zip
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/no-home-paths.sh
 
 export MACOSX_DEPLOYMENT_TARGET=11.0
 ffmpeg_version=8.1
@@ -29,6 +30,9 @@ if [ ! -f "$ffmpeg/lib/libavcodec.dylib" ]; then
             --x86asmexe=nasm --enable-shared --disable-static --install-name-dir='@rpath' \
             --disable-programs --disable-doc --disable-debug \
             --disable-autodetect --enable-videotoolbox --enable-audiotoolbox >/dev/null
+        # FFmpeg keeps its configure line (with the install path) in the
+        # libraries; leave the home folder out of it.
+        sed -i '' "s#$HOME#/build#g" config.h
         make -j"$(sysctl -n hw.ncpu)" >/dev/null
         make install >/dev/null
         cp COPYING.LGPLv2.1 "$ffmpeg/LICENSE.txt"
@@ -40,13 +44,15 @@ fi
 # The bundled FFmpeg is found through an rpath into the bundle.
 FFMPEG_DIR="$ffmpeg" PKG_CONFIG_PATH="$ffmpeg/lib/pkgconfig" \
     BINDGEN_EXTRA_CLANG_ARGS="--target=$target" \
-    RUSTFLAGS="-C link-arg=-Wl,-rpath,@executable_path/../Frameworks" \
+    RUSTFLAGS="$RUSTFLAGS -C link-arg=-Wl,-rpath,@executable_path/../Frameworks" \
     cargo build --release --target $target -p silkscreen --no-default-features
 
 out=dist/silkscreen-macos-intel
 app=$out/Silkscreen.app/Contents
 rm -rf "$out" && mkdir -p "$app/MacOS" "$app/Frameworks" "$app/Resources"
 cp target/$target/release/silkscreen "$app/MacOS/"
+# Drop the debug map (paths to the build's object files); symbols stay.
+strip -S "$app/MacOS/silkscreen"
 for lib in avcodec avdevice avfilter avformat avutil swresample swscale; do
     cp "$ffmpeg"/lib/lib$lib.*.dylib "$app/Frameworks/" 2>/dev/null || true
 done
@@ -80,5 +86,6 @@ for f in "$app"/Frameworks/*.dylib; do codesign --force -s "$sign_id" "$f"; done
 codesign --force -s "$sign_id" "$out/Silkscreen.app"
 cp README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md "$out/"
 cp "$ffmpeg/LICENSE.txt" "$out/FFMPEG-LICENSE.txt"
+check_no_home_paths "$out"
 (cd dist && rm -f silkscreen-macos-intel.zip && zip -qry silkscreen-macos-intel.zip silkscreen-macos-intel)
 echo "built dist/silkscreen-macos-intel.zip"

@@ -6,6 +6,7 @@
 # x86_64-linux-android. Output: dist/silkscreen-android.apk
 set -euo pipefail
 cd "$(dirname "$0")/.."
+. scripts/no-home-paths.sh
 
 export ANDROID_HOME=${ANDROID_HOME:-$HOME/Android/Sdk}
 export ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-$(ls -d "$ANDROID_HOME"/ndk/* | sort -V | tail -1)}
@@ -20,4 +21,5 @@ cd android
 cd ..
 mkdir -p dist
 cp "android/app/build/outputs/apk/$variant/app-$variant.apk" dist/silkscreen-android.apk
+check_no_home_paths android/app/src/main/jniLibs
 echo "built dist/silkscreen-android.apk"
