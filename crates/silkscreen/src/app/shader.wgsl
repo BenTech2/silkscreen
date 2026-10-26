@@ -1,11 +1,11 @@
-// YUV 4:2:0 (NV12 or I420) to RGB.
+// YUV (NV12, NV24, I420 or I444) to RGB.
 
 struct Params {
     // rgb[i] = dot(row_i.xyz, yuv) + row_i.w
     row_r: vec4<f32>,
     row_g: vec4<f32>,
     row_b: vec4<f32>,
-    // 0 = NV12 (interleaved UV in tex_u), 1 = I420 (separate U and V)
+    // 0 = interleaved UV in tex_u (NV12, NV24), 1 = separate U and V (I420, I444)
     mode: u32,
     // 1 when the swapchain is sRGB and expects linear output
     linearize: u32,

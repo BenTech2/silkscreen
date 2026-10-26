@@ -1,6 +1,11 @@
-// Embeds the app icon (assets/icon.ico) in silkscreen.exe.
+// Embeds the app icon (assets/icon.ico) in silkscreen.exe. On macOS, links
+// ScreenCaptureKit (macOS 12.3+) weakly so the app also starts on older
+// macOS, where it works as a display.
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-weak_framework,ScreenCaptureKit");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
         return;
     }

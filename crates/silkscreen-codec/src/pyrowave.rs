@@ -12,6 +12,8 @@
 //! `[width u16][height u16][packet count u32][packet sizes u32…][packets…]`
 //! (little endian): PyroWave's own packets are decoded one by one, and the
 //! size lets the display create its decoder without a separate handshake.
+//! The width's top bit marks 4:4:4 (full-resolution colour); widths stay
+//! below 16384, so it is otherwise unused.
 
 use std::ffi::{c_int, c_void};
 use std::sync::OnceLock;
@@ -19,7 +21,7 @@ use std::sync::OnceLock;
 use anyhow::{Context, Result, bail, ensure};
 use tracing::{info, warn};
 
-use crate::convert::{ChromaLayout, RgbFrame, YuvPlanes, rgb_to_yuv420};
+use crate::convert::{ChromaLayout, RgbFrame, YuvPlanes, rgb_to_yuv};
 use crate::decoder::{Matrix, Picture, PictureFormat};
 use crate::encoder::EncoderConfig;
 
@@ -32,7 +34,9 @@ mod ffi {
     pub type Result = c_int;
     pub const SUCCESS: Result = 0;
     pub const CHROMA_420: c_int = 0;
+    pub const CHROMA_444: c_int = 1;
     pub const CPU_YUV420P: c_int = 1;
+    pub const CPU_YUV444P: c_int = 2;
 
     #[repr(C)]
     pub struct EncoderCreateInfo {
@@ -156,7 +160,11 @@ mod ffi {
     #[cfg(target_os = "macos")]
     unsafe extern "C" {
         pub fn pyrowave_result_to_string(r: Result) -> *const std::ffi::c_char;
-        pub fn silkscreen_pyrowave_readback_new(width: c_int, height: c_int) -> *mut c_void;
+        pub fn silkscreen_pyrowave_readback_new(
+            width: c_int,
+            height: c_int,
+            full_chroma: c_int,
+        ) -> *mut c_void;
         pub fn silkscreen_pyrowave_readback_decode(
             readback: *mut c_void,
             dec: Decoder,
@@ -222,6 +230,9 @@ const BACKEND: &str = if cfg!(target_os = "macos") {
     "Vulkan"
 };
 
+/// Marks a 4:4:4 frame in the width field of the frame header.
+const FULL_CHROMA: u16 = 0x8000;
+
 /// PyroWave's packets, whose size it treats as a guideline (oversized
 /// blocks make bigger ones). Silkscreen splits frames into datagrams itself.
 const PACKET_BOUNDARY: usize = 16 * 1024;
@@ -259,6 +270,7 @@ pub fn probe_here() -> bool {
             refresh_mhz: 60_000,
             bitrate_kbps: default_bitrate_kbps(w, h, 60_000),
             encoder: None,
+            chroma444: false,
         };
         let mut frame = Vec::new();
         PyroEncoder::open(&cfg)?.encode(&src, |d, _| frame = d.to_vec())?;
@@ -320,44 +332,75 @@ pub fn default_bitrate_kbps(width: u32, height: u32, refresh_mhz: u32) -> u32 {
     (kbps as u32).clamp(50_000, 900_000)
 }
 
-/// Planar YUV 4:2:0 in one allocation, in the layout PyroWave's CPU calls use.
+/// Planar YUV (4:2:0, or 4:4:4) in one allocation, in the layout
+/// PyroWave's CPU calls use.
 struct Planes {
     data: Vec<u8>,
     width: usize,
     height: usize,
+    full_chroma: bool,
 }
 
 impl Planes {
-    fn new(width: usize, height: usize) -> Self {
+    fn new(width: usize, height: usize, full_chroma: bool) -> Self {
+        let chroma = if full_chroma {
+            width * height
+        } else {
+            width * height / 4
+        };
         Planes {
-            data: vec![0; width * height * 3 / 2],
+            data: vec![0; width * height + 2 * chroma],
             width,
             height,
+            full_chroma,
+        }
+    }
+
+    /// Width (= row stride) of the U and V planes.
+    fn chroma_width(&self) -> usize {
+        if self.full_chroma {
+            self.width
+        } else {
+            self.width / 2
+        }
+    }
+
+    fn layout(&self) -> ChromaLayout {
+        if self.full_chroma {
+            ChromaLayout::I444
+        } else {
+            ChromaLayout::I420
         }
     }
 
     fn split(&mut self) -> (&mut [u8], &mut [u8], &mut [u8]) {
         let y = self.width * self.height;
-        let c = y / 4;
+        let c = (self.data.len() - y) / 2;
         let (ya, rest) = self.data.split_at_mut(y);
         let (u, v) = rest.split_at_mut(c);
         (ya, u, &mut v[..c])
     }
 
     fn cpu_buffer(&mut self) -> ffi::CpuBuffer {
-        let (w, h) = (self.width, self.height);
+        let (w, h, cw) = (self.width, self.height, self.chroma_width());
+        let format = if self.full_chroma {
+            ffi::CPU_YUV444P
+        } else {
+            ffi::CPU_YUV420P
+        };
         let (y, u, v) = self.split();
+        let c = u.len();
         ffi::CpuBuffer {
             data: [
                 y.as_mut_ptr().cast(),
                 u.as_mut_ptr().cast(),
                 v.as_mut_ptr().cast(),
             ],
-            row_stride_in_bytes: [w, w / 2, w / 2],
-            plane_size_in_bytes: [w * h, w * h / 4, w * h / 4],
+            row_stride_in_bytes: [w, cw, cw],
+            plane_size_in_bytes: [w * h, c, c],
             width: w as c_int,
             height: h as c_int,
-            format: ffi::CPU_YUV420P,
+            format,
         }
     }
 }
@@ -392,7 +435,11 @@ impl PyroEncoder {
             device,
             width: cfg.width as c_int,
             height: cfg.height as c_int,
-            chroma: ffi::CHROMA_420,
+            chroma: if cfg.chroma444 {
+                ffi::CHROMA_444
+            } else {
+                ffi::CHROMA_420
+            },
         };
         let mut enc = std::ptr::null_mut();
         check(
@@ -409,7 +456,7 @@ impl PyroEncoder {
         );
         Ok(PyroEncoder {
             enc,
-            planes: Planes::new(cfg.width as usize, cfg.height as usize),
+            planes: Planes::new(cfg.width as usize, cfg.height as usize, cfg.chroma444),
             budget,
             // The rate control is exact, plus some headroom for packet headers.
             bitstream: vec![0; budget * 2 + 64 * 1024],
@@ -436,15 +483,16 @@ impl PyroEncoder {
             src.height
         );
         {
+            let (cw, layout) = (self.planes.chroma_width(), self.planes.layout());
             let (y, u, v) = self.planes.split();
             let dst = YuvPlanes {
                 y,
                 y_stride: w,
                 u,
-                u_stride: w / 2,
-                v: Some((v, w / 2)),
+                u_stride: cw,
+                v: Some((v, cw)),
             };
-            rgb_to_yuv420(src, dst, ChromaLayout::I420);
+            rgb_to_yuv(src, dst, layout);
         }
         let input = self.planes.cpu_buffer();
         let rc = ffi::RateControl {
@@ -477,7 +525,12 @@ impl PyroEncoder {
         }
         let f = &mut self.frame;
         f.clear();
-        f.extend_from_slice(&(w as u16).to_le_bytes());
+        let flag = if self.planes.full_chroma {
+            FULL_CHROMA
+        } else {
+            0
+        };
+        f.extend_from_slice(&(w as u16 | flag).to_le_bytes());
         f.extend_from_slice(&(h as u16).to_le_bytes());
         f.extend_from_slice(&(self.packets.len() as u32).to_le_bytes());
         for p in &self.packets {
@@ -544,12 +597,10 @@ impl PyroDecoder {
         }
     }
 
-    fn sized(&mut self, width: usize, height: usize) -> Result<&mut Sized> {
-        if self
-            .sized
-            .as_ref()
-            .is_some_and(|s| (s.planes.width, s.planes.height) == (width, height))
-        {
+    fn sized(&mut self, width: usize, height: usize, full_chroma: bool) -> Result<&mut Sized> {
+        if self.sized.as_ref().is_some_and(|s| {
+            (s.planes.width, s.planes.height, s.planes.full_chroma) == (width, height, full_chroma)
+        }) {
             return Ok(self.sized.as_mut().unwrap());
         }
         self.sized = None;
@@ -558,7 +609,11 @@ impl PyroDecoder {
             device,
             width: width as c_int,
             height: height as c_int,
-            chroma: ffi::CHROMA_420,
+            chroma: if full_chroma {
+                ffi::CHROMA_444
+            } else {
+                ffi::CHROMA_420
+            },
             #[cfg(not(target_os = "macos"))]
             fragment_path: unsafe { ffi::pyrowave_decoder_device_prefers_fragment_path(device) },
         };
@@ -568,8 +623,13 @@ impl PyroDecoder {
             "creating the PyroWave decoder",
         )?;
         #[cfg(target_os = "macos")]
-        let readback =
-            unsafe { ffi::silkscreen_pyrowave_readback_new(width as c_int, height as c_int) };
+        let readback = unsafe {
+            ffi::silkscreen_pyrowave_readback_new(
+                width as c_int,
+                height as c_int,
+                full_chroma as c_int,
+            )
+        };
         #[cfg(target_os = "macos")]
         if readback.is_null() {
             unsafe { ffi::pyrowave_decoder_destroy(dec) };
@@ -578,15 +638,15 @@ impl PyroDecoder {
         info!("opened {width}x{height} PyroWave decoder ({BACKEND})");
         Ok(self.sized.insert(Sized {
             dec,
-            planes: Planes::new(width, height),
+            planes: Planes::new(width, height, full_chroma),
             #[cfg(target_os = "macos")]
             readback,
         }))
     }
 
     pub fn decode(&mut self, data: &[u8]) -> Result<Option<Picture<'_>>> {
-        let (width, height, packets) = parse_frame(data)?;
-        let s = self.sized(width, height)?;
+        let (width, height, full_chroma, packets) = parse_frame(data)?;
+        let s = self.sized(width, height, full_chroma)?;
         unsafe {
             ffi::pyrowave_decoder_clear(s.dec);
             for p in packets {
@@ -605,27 +665,34 @@ impl PyroDecoder {
             let r = ffi::pyrowave_decoder_decode_cpu_buffer_synchronous(s.dec, &out);
             check(r, "PyroWave decode")?;
         }
-        let (w, h) = (width, height);
+        let (w, h, cw) = (width, height, s.planes.chroma_width());
+        let format = if full_chroma {
+            PictureFormat::I444
+        } else {
+            PictureFormat::I420
+        };
         let (y, u, v) = s.planes.split();
         Ok(Some(Picture {
-            format: PictureFormat::I420,
+            format,
             width: w as u32,
             height: h as u32,
             matrix: Matrix::Bt709,
             full_range: false,
-            planes: vec![(&*y, w), (&*u, w / 2), (&*v, w / 2)],
+            planes: vec![(&*y, w), (&*u, cw), (&*v, cw)],
         }))
     }
 }
 
-/// Splits a frame into its size and PyroWave packets.
-fn parse_frame(data: &[u8]) -> Result<(usize, usize, Vec<&[u8]>)> {
+/// Splits a frame into its size, chroma (true: 4:4:4) and PyroWave packets.
+fn parse_frame(data: &[u8]) -> Result<(usize, usize, bool, Vec<&[u8]>)> {
     let u32_at = |i: usize| -> Result<usize> {
         let b = data.get(i..i + 4).context("truncated PyroWave frame")?;
         Ok(u32::from_le_bytes(b.try_into().unwrap()) as usize)
     };
     ensure!(data.len() >= 8, "truncated PyroWave frame");
-    let width = u16::from_le_bytes([data[0], data[1]]) as usize;
+    let raw_width = u16::from_le_bytes([data[0], data[1]]);
+    let full_chroma = raw_width & FULL_CHROMA != 0;
+    let width = (raw_width & !FULL_CHROMA) as usize;
     let height = u16::from_le_bytes([data[2], data[3]]) as usize;
     ensure!(
         width > 0 && height > 0 && width.is_multiple_of(2) && height.is_multiple_of(2),
@@ -643,7 +710,7 @@ fn parse_frame(data: &[u8]) -> Result<(usize, usize, Vec<&[u8]>)> {
         packets.push(p);
         at += size;
     }
-    Ok((width, height, packets))
+    Ok((width, height, full_chroma, packets))
 }
 
 #[cfg(test)]
@@ -691,6 +758,7 @@ mod tests {
             refresh_mhz: 60_000,
             bitrate_kbps: default_bitrate_kbps(w, h, 60_000),
             encoder: None,
+            chroma444: false,
         };
         let mut enc = PyroEncoder::open(&cfg).unwrap();
         let mut frame = Vec::new();
@@ -703,7 +771,7 @@ mod tests {
         let pic = dec.decode(&frame).unwrap().unwrap();
         assert_eq!((pic.width, pic.height), (w, h));
         // Compare luma against the converter's own output.
-        let mut expect = Planes::new(w as usize, h as usize);
+        let mut expect = Planes::new(w as usize, h as usize, false);
         {
             let (y, u, v) = expect.split();
             let dst = YuvPlanes {
@@ -713,7 +781,7 @@ mod tests {
                 u_stride: w as usize / 2,
                 v: Some((v, w as usize / 2)),
             };
-            rgb_to_yuv420(&src, dst, ChromaLayout::I420);
+            rgb_to_yuv(&src, dst, ChromaLayout::I420);
         }
         let (ey, _, _) = expect.split();
         let mse = pic.planes[0]
@@ -725,5 +793,55 @@ mod tests {
             / ey.len() as f64;
         let psnr = 10.0 * (255.0f64 * 255.0 / mse.max(1e-9)).log10();
         assert!(psnr > 35.0, "luma PSNR {psnr:.1} dB");
+    }
+
+    /// 4:4:4 keeps a 1-pixel red/blue checkerboard's colours apart.
+    #[test]
+    fn roundtrip_444() {
+        if !available() {
+            eprintln!("PyroWave unavailable here; skipping");
+            return;
+        }
+        let (w, h) = (128u32, 96u32);
+        let mut rgb = vec![0u8; (w * h * 4) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let i = ((y * w + x) * 4) as usize;
+                rgb[i + if (x + y) % 2 == 0 { 2 } else { 0 }] = 220;
+            }
+        }
+        let src = RgbFrame {
+            width: w,
+            height: h,
+            stride: (w * 4) as usize,
+            layout: RgbLayout::Bgrx,
+            data: &rgb,
+        };
+        let cfg = EncoderConfig {
+            codec: Codec::PyroWave,
+            width: w,
+            height: h,
+            refresh_mhz: 60_000,
+            bitrate_kbps: 400_000,
+            encoder: None,
+            chroma444: true,
+        };
+        let mut frame = Vec::new();
+        PyroEncoder::open(&cfg)
+            .unwrap()
+            .encode(&src, |d, _| frame = d.to_vec())
+            .unwrap();
+        let mut dec = PyroDecoder::open().unwrap();
+        let pic = dec.decode(&frame).unwrap().unwrap();
+        assert_eq!(pic.format, PictureFormat::I444);
+        let (v, stride) = pic.planes[2];
+        let mut sum = 0u64;
+        for y in 0..h as usize {
+            for x in 1..w as usize {
+                sum += (v[y * stride + x] as i64 - v[y * stride + x - 1] as i64).unsigned_abs();
+            }
+        }
+        let contrast = sum as f64 / ((w as usize - 1) * h as usize) as f64;
+        assert!(contrast > 40.0, "colour detail lost: {contrast:.1}");
     }
 }

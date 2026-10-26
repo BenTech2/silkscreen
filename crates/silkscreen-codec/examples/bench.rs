@@ -52,6 +52,7 @@ fn main() {
         refresh_mhz: 60_000,
         bitrate_kbps: 50_000,
         encoder: forced,
+        chroma444: false,
     })
     .unwrap();
     for i in 0..5 {

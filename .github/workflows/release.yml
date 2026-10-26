@@ -1,11 +1,12 @@
 name: Release
 
-# Builds the macOS app and the Linux / Raspberry Pi bundles and attaches them
-# to a published release. The Windows zip and the Android APK are built with
-# scripts/ (package-windows.sh, build-android.sh) and uploaded by hand.
+# A fallback for building the macOS apps (Apple Silicon, Intel) and the Linux
+# x86_64 bundle on GitHub and attaching them to a release. Normally every
+# download is built on an Apple Silicon Mac with scripts/ and uploaded by hand
+# (it saves Actions minutes, and the Raspberry Pi build takes ~2 min natively
+# there versus ~2 h under emulation here), so this only runs when started by
+# hand: Actions → Release → Run workflow, with the tag.
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -19,55 +20,43 @@ jobs:
   macos:
     runs-on: macos-15
     env:
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - run: scripts/fetch-submodules.sh
       - uses: dtolnay/rust-toolchain@stable
       - run: brew install ffmpeg pkg-config dylibbundler
-      - run: cargo build --release -p silkscreen
-      - name: Build Silkscreen.app with its own FFmpeg
-        run: |
-          out=dist/silkscreen-macos-arm64
-          app=$out/Silkscreen.app/Contents
-          mkdir -p "$app/MacOS" "$app/Frameworks" "$app/Resources"
-          cp target/release/silkscreen "$app/MacOS/"
-          # Copy Homebrew's FFmpeg and its dependencies into the bundle.
-          dylibbundler -od -b -x "$app/MacOS/silkscreen" -d "$app/Frameworks" -p @executable_path/../Frameworks/
-          # App icon (on Apple's icon grid) rendered by scripts/render-icons.sh.
-          set=$RUNNER_TEMP/silkscreen.iconset && mkdir -p "$set"
-          for s in 16 32 128 256 512; do
-            cp assets/png/macos/icon-$s.png "$set/icon_${s}x${s}.png"
-            cp assets/png/macos/icon-$((s * 2)).png "$set/icon_${s}x${s}@2x.png"
-          done
-          iconutil -c icns "$set" -o "$app/Resources/silkscreen.icns"
-          version=$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "silkscreen") | .version')
-          sed "s/@VERSION@/$version/g" assets/Info.plist > "$app/Info.plist"
-          # Rewriting load paths invalidates signatures; Apple Silicon needs one.
-          for f in "$app"/Frameworks/*.dylib; do codesign --force -s - "$f"; done
-          codesign --force -s - "$out/Silkscreen.app"
-          cp README.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md THIRD-PARTY-LICENSES.md "$out/"
-          cp third_party/pyrowave/LICENSE "$out/PYROWAVE-LICENSE.txt"
-          "$app/MacOS/silkscreen" doctor
-          (cd dist && zip -qry silkscreen-macos-arm64.zip silkscreen-macos-arm64)
+      - run: scripts/package-macos.sh
       - run: gh release upload "$TAG" dist/silkscreen-macos-arm64.zip --clobber
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+  # Intel Macs on macOS 11+ (e.g. the 2014 Retina 5K iMac as a display).
+  macos-intel:
+    runs-on: macos-15
+    env:
+      TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-apple-darwin
+      - run: brew install nasm
+      - run: scripts/package-macos-intel.sh
+      - run: gh release upload "$TAG" dist/silkscreen-macos-intel.zip --clobber
         env:
           GH_TOKEN: ${{ github.token }}
 
   linux:
     runs-on: ubuntu-24.04
     strategy:
-      fail-fast: false
       matrix:
-        arch: [x86_64, aarch64]
+        arch: [x86_64]
     env:
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ inputs.tag }}
     steps:
       - uses: actions/checkout@v4
       - run: scripts/fetch-submodules.sh
-      # The Raspberry Pi (aarch64) bundle builds under emulation.
-      - uses: docker/setup-qemu-action@v3
-        if: matrix.arch == 'aarch64'
       - run: scripts/package-linux.sh ${{ matrix.arch }}
       - run: gh release upload "$TAG" dist/silkscreen-linux-${{ matrix.arch }}.tar.gz --clobber
         env:

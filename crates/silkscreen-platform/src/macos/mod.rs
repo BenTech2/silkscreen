@@ -29,7 +29,18 @@ fn describe(id: CGDirectDisplayID) -> String {
     )
 }
 
+/// ScreenCaptureKit (macOS 12.3+) is linked weakly: older macOS can still
+/// run Silkscreen as a display, just not capture its own screen.
+fn capture_available() -> bool {
+    objc2::runtime::AnyClass::get(c"SCStream").is_some()
+}
+
 pub fn open_screen(req: &ScreenRequest) -> Result<Screen> {
+    if !capture_available() {
+        anyhow::bail!(
+            "sharing this Mac's screen needs macOS 12.3 or later; on this Mac, Silkscreen works as a display"
+        );
+    }
     let (display_id, guard) = match &req.kind {
         SourceKind::Virtual => {
             let vd = virtual_display::VirtualDisplay::create(req)?;
@@ -105,13 +116,21 @@ pub fn monitor_list() -> Vec<crate::MonitorInfo> {
 
 pub fn diagnostics() -> Vec<(String, String)> {
     let mut out = vec![(
+        "screen capture".into(),
+        if capture_available() {
+            "ScreenCaptureKit".into()
+        } else {
+            "unavailable (macOS 12.3+ required; display mode works)".into()
+        },
+    )];
+    out.push((
         "virtual displays".into(),
         if virtual_display::available() {
             "CGVirtualDisplay".into()
         } else {
             "unavailable (macOS 11+ required)".into()
         },
-    )];
+    ));
     for d in active_displays() {
         out.push(("display".into(), describe(d)));
     }
